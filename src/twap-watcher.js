@@ -3,6 +3,11 @@ import dns from 'dns'
 import https from 'https'
 import WebSocket from 'ws'
 import { cancelOrders, fetchAllOpenOrders } from './predict-client.js'
+import { parseConfiguredTargets } from './cleanup.js'
+
+function timeStr() {
+  return new Date().toISOString().slice(11, 19)
+}
 
 // ─── DoH (DNS over HTTPS) Helper ─────────────────────────────────────────────
 const dnsCache = new Map()
@@ -53,29 +58,14 @@ export function customDohLookup(hostname, options, callback) {
     .catch(() => dns.lookup(hostname, options, cb))
 }
 
-// ─── Constants & Configuration ───────────────────────────────────────────────
+// ─── Constants & State ───────────────────────────────────────────────────────
 const BINANCE_WS_HOST = 'data-stream.binance.vision'
-const DEFAULT_ASSETS = ['eth', 'btc', 'sol', 'xrp', 'doge', 'bnb']
-const DEFAULT_DURATIONS = ['5m', '15m']
 
-// In-memory price state
-// latestPrices[asset] = { spot, twap30s, twap60s, lastUpdateMs }
 const latestPrices = new Map()
-
-// priceHistory[asset] = array of { ts: epochSeconds, price }
 const priceHistory = new Map()
-
-// marketOpenPrices: slug -> openPrice (float)
 const marketOpenPrices = new Map()
-
-// triggeredSlugs: Set of slugs whose orders were already canceled this window
 const triggeredSlugs = new Set()
 
-/**
- * Reads configured percentage threshold for an asset (e.g. CANCEL_THRES_BTC=0.3).
- * Falls back to CANCEL_THRES_DEFAULT or CANCEL_THRES_PERCENT if set.
- * Returns threshold as a positive number (e.g. 0.3 for 0.3%), or null if not set.
- */
 export function getThreshold(asset) {
   const assetKey = asset.toUpperCase()
   const raw = process.env[`CANCEL_THRES_${assetKey}`]
@@ -93,16 +83,10 @@ export function getThreshold(asset) {
   return null
 }
 
-/**
- * Checks if a market slug has breached its TWAP percentage threshold.
- */
 export function isTwapThresholdBreached(slug) {
   return triggeredSlugs.has(slug)
 }
 
-/**
- * Returns latest tracked TWAP information for debugging / logging.
- */
 export function getTwapStatus() {
   const status = {}
   for (const [asset, data] of latestPrices.entries()) {
@@ -111,9 +95,6 @@ export function getTwapStatus() {
   return status
 }
 
-/**
- * Calculates TWAP over a window in seconds from historical price ticks.
- */
 function calculateTwap(asset, windowSec, nowSec) {
   const sym = asset.toLowerCase()
   const list = priceHistory.get(sym)
@@ -133,11 +114,6 @@ function calculateTwap(asset, windowSec, nowSec) {
   return count > 0 ? sum / count : null
 }
 
-/**
- * Returns effective TWAP or spot price for an asset given market duration.
- * 5m markets resolve on 30s TWAP (or spot fallback).
- * 15m markets resolve on 60s TWAP (or 30s / spot fallback).
- */
 export function getEffectiveTwap(asset, duration) {
   const sym = asset.toLowerCase()
   const data = latestPrices.get(sym)
@@ -151,9 +127,6 @@ export function getEffectiveTwap(asset, duration) {
   }
 }
 
-/**
- * Records a price tick into latest state and historical ring buffer.
- */
 function recordPriceTick(asset, price, tsMs) {
   const sym = asset.toLowerCase()
   const tsSec = Math.floor(tsMs / 1000)
@@ -169,7 +142,6 @@ function recordPriceTick(asset, price, tsMs) {
   const list = priceHistory.get(sym)
   list.push({ ts: tsSec, price })
 
-  // Prune history older than 35 minutes (2100s)
   const cutoff = tsSec - 2100
   while (list.length > 0 && list[0].ts < cutoff) {
     list.shift()
@@ -179,9 +151,6 @@ function recordPriceTick(asset, price, tsMs) {
   current.twap60s = calculateTwap(sym, 60, tsSec)
 }
 
-/**
- * Finds historical price at or closest to a specific timestamp.
- */
 function findHistoricalPrice(asset, targetTsSec) {
   const sym = asset.toLowerCase()
   const list = priceHistory.get(sym)
@@ -192,7 +161,7 @@ function findHistoricalPrice(asset, targetTsSec) {
 
   for (const item of list) {
     const diff = Math.abs(item.ts - targetTsSec)
-    if (diff < minDiff && diff <= 45) { // within 45s tolerance
+    if (diff < minDiff && diff <= 45) {
       minDiff = diff
       best = item.price
     }
@@ -202,101 +171,75 @@ function findHistoricalPrice(asset, targetTsSec) {
 }
 
 /**
- * Evaluates active markets and cancels orders if TWAP delta exceeds threshold.
+ * Evaluates active markets silently; logs strictly 1 line when a breach occurs.
  */
 async function checkThresholdsForActiveMarkets({
   lookupMarketBySlug,
-  assets,
-  durations,
+  targets,
 }) {
   const nowSec = Math.floor(Date.now() / 1000)
 
-  for (const asset of assets) {
+  for (const { asset, duration } of targets) {
     const threshold = getThreshold(asset)
     if (threshold === null) continue
 
-    for (const duration of durations) {
-      const durationSec = duration === '5m' ? 300 : 900
+    const durationSec = duration === '15m' ? 900 : 300
+    const activeTs = Math.floor(nowSec / durationSec) * durationSec
+    const endTime = activeTs + durationSec
 
-      // Active window check
-      const currentBoundary = Math.floor(nowSec / 300) * 300
-      const startFrom = currentBoundary - durationSec + 300
+    if (nowSec >= endTime) continue
 
-      for (let startTs = startFrom; startTs <= currentBoundary; startTs += 300) {
-        const endTime = startTs + durationSec
-        if (nowSec < startTs || nowSec >= endTime) continue
+    const slug = `${asset}-updown-${duration}-${activeTs}`
+    if (triggeredSlugs.has(slug)) continue
 
-        const slug = `${asset}-updown-${duration}-${startTs}`
-        if (triggeredSlugs.has(slug)) continue
+    let openPrice = marketOpenPrices.get(slug)
+    if (!openPrice) {
+      openPrice = findHistoricalPrice(asset, activeTs)
+      if (!openPrice) {
+        openPrice = getEffectiveTwap(asset, duration)
+      }
+      if (openPrice && openPrice > 0) {
+        marketOpenPrices.set(slug, openPrice)
+      }
+    }
 
-        // 1. Determine open price for this market
-        let openPrice = marketOpenPrices.get(slug)
-        if (!openPrice) {
-          openPrice = findHistoricalPrice(asset, startTs)
-          if (!openPrice) {
-            openPrice = getEffectiveTwap(asset, duration)
-          }
+    if (!openPrice || openPrice <= 0) continue
 
-          if (openPrice && openPrice > 0) {
-            marketOpenPrices.set(slug, openPrice)
-            console.log(`[twap-threshold] 📌 [${slug}] Registered Open Price: $${openPrice.toFixed(4)} (Threshold: ±${threshold}%)`)
-          }
+    const currentTwap = getEffectiveTwap(asset, duration)
+    if (!currentTwap || currentTwap <= 0) continue
+
+    const deltaPercent = Math.abs((currentTwap - openPrice) / openPrice) * 100
+
+    if (deltaPercent >= threshold) {
+      triggeredSlugs.add(slug)
+
+      try {
+        const market = await lookupMarketBySlug(slug)
+        if (!market || !market.marketId) continue
+
+        const allOrders = await fetchAllOpenOrders()
+        const marketOrders = allOrders.filter(o => String(o.marketId) === String(market.marketId))
+
+        if (marketOrders.length === 0) {
+          console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | 0 orders found`)
+          continue
         }
 
-        if (!openPrice || openPrice <= 0) continue
-
-        // 2. Get current live price / TWAP
-        const currentTwap = getEffectiveTwap(asset, duration)
-        if (!currentTwap || currentTwap <= 0) continue
-
-        // 3. Compute percentage delta
-        const deltaPercent = Math.abs((currentTwap - openPrice) / openPrice) * 100
-
-        // 4. Check if breached
-        if (deltaPercent >= threshold) {
-          triggeredSlugs.add(slug)
-
-          console.log(`\n═══════════════════════════════════════════════════════════════════`)
-          console.log(`[twap-threshold] 🚨 BREACH DETECTED for [${slug}]!`)
-          console.log(`  Current TWAP/Spot: $${currentTwap.toFixed(4)}`)
-          console.log(`  Open Price:        $${openPrice.toFixed(4)}`)
-          console.log(`  Delta:             ${deltaPercent.toFixed(4)}% >= Threshold: ${threshold}%`)
-          console.log(`  Action:            Canceling ALL open orders for market on Predict.fun...`)
-          console.log(`═══════════════════════════════════════════════════════════════════`)
-
-          try {
-            const market = await lookupMarketBySlug(slug)
-            if (!market || !market.marketId) {
-              console.warn(`[twap-threshold] Could not resolve market ID for ${slug}`)
-              continue
-            }
-
-            const allOrders = await fetchAllOpenOrders()
-            const marketOrders = allOrders.filter(o => String(o.marketId) === String(market.marketId))
-
-            if (marketOrders.length === 0) {
-              console.log(`[twap-threshold] [${slug}] 0 open orders found.`)
-              continue
-            }
-
-            const ids = marketOrders.map(o => o.id)
-            const result = await cancelOrders(ids)
-            console.log(`[twap-threshold] ✓ [${slug}] Successfully canceled all ${ids.length} open order(s)!`)
-          } catch (cancelErr) {
-            console.error(`[twap-threshold] Error canceling orders for ${slug}: ${cancelErr.message}`)
-          }
-        }
+        const ids = marketOrders.map(o => o.id)
+        await cancelOrders(ids)
+        console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | Canceled ${ids.length} order(s)`)
+      } catch (cancelErr) {
+        console.error(`[${timeStr()}] [BREACH] Error for ${slug}: ${cancelErr.message}`)
       }
     }
   }
 
-  // Periodic cleanup of expired market state
   for (const [slug] of marketOpenPrices.entries()) {
     const parts = slug.split('-')
-    const startTs = parseInt(parts[parts.length - 1], 10)
+    const activeTs = parseInt(parts[parts.length - 1], 10)
     const duration = parts[2]
-    const durationSec = duration === '5m' ? 300 : 900
-    if (!isNaN(startTs) && nowSec >= startTs + durationSec + 60) {
+    const durationSec = duration === '15m' ? 900 : 300
+    if (!isNaN(activeTs) && nowSec >= activeTs + durationSec + 60) {
       marketOpenPrices.delete(slug)
       triggeredSlugs.delete(slug)
     }
@@ -305,28 +248,19 @@ async function checkThresholdsForActiveMarkets({
 
 // ─── WebSocket Client for Binance Spot Price Stream ──────────────────────────
 let binanceWs = null
-let pingInterval = null
 let reconnectTimeout = null
 let checkInterval = null
 let isShuttingDown = false
 
 export function startTwapWatcher({
   lookupMarketBySlug,
-  assets = DEFAULT_ASSETS,
-  durations = DEFAULT_DURATIONS,
+  targets = parseConfiguredTargets(),
 }) {
-  const configuredAssets = assets.filter(a => getThreshold(a) !== null)
-  if (configuredAssets.length === 0) {
-    console.log("[twap-threshold] No CANCEL_THRES_* variables configured. Watcher inactive.")
-    return { stop: () => {} }
-  }
+  const uniqueAssets = [...new Set(targets.map(t => t.asset))]
+  const configuredAssets = uniqueAssets.filter(a => getThreshold(a) !== null)
+  if (configuredAssets.length === 0) return { stop: () => {} }
 
-  console.log(`[twap-threshold] 🚀 Initializing TWAP Threshold Watcher via Binance Spot Stream...`)
-  for (const a of configuredAssets) {
-    console.log(`  └─ ${a.toUpperCase()}: threshold = ${getThreshold(a)}%`)
-  }
-
-  const streams = assets.map(a => `${a.toLowerCase()}usdt@ticker`).join('/')
+  const streams = uniqueAssets.map(a => `${a.toLowerCase()}usdt@ticker`).join('/')
   const streamUrl = `wss://${BINANCE_WS_HOST}:9443/stream?streams=${streams}`
 
   function connect() {
@@ -337,17 +271,10 @@ export function startTwapWatcher({
       binanceWs.terminate()
       binanceWs = null
     }
-    if (pingInterval) clearInterval(pingInterval)
 
     binanceWs = new WebSocket(streamUrl, {
       lookup: customDohLookup,
-      headers: {
-        'User-Agent': 'pf-sizer/2.0',
-      },
-    })
-
-    binanceWs.on('open', () => {
-      console.log(`[twap-threshold] Connected to Binance Spot WS stream (tracking: ${assets.join(', ')}).`)
+      headers: { 'User-Agent': 'pf-sizer/2.0' },
     })
 
     binanceWs.on('message', (data) => {
@@ -369,13 +296,8 @@ export function startTwapWatcher({
       } catch {}
     })
 
-    binanceWs.on('error', (err) => {
-      if (!isShuttingDown) console.warn(`[twap-threshold] Binance WS error: ${err.message}`)
-    })
-
-    binanceWs.on('close', (code) => {
+    binanceWs.on('close', () => {
       if (!isShuttingDown) {
-        console.log(`[twap-threshold] Binance WS disconnected (${code}). Reconnecting in 3s...`)
         reconnectTimeout = setTimeout(connect, 3000)
       }
     })
@@ -383,13 +305,11 @@ export function startTwapWatcher({
 
   connect()
 
-  // Evaluate every 1 second
   checkInterval = setInterval(() => {
     checkThresholdsForActiveMarkets({
       lookupMarketBySlug,
-      assets,
-      durations,
-    }).catch(err => console.error(`[twap-threshold] Check loop error: ${err.message}`))
+      targets,
+    }).catch(err => console.error(`[${timeStr()}] [TWAP] Error: ${err.message}`))
   }, 1000)
 
   return {
@@ -407,17 +327,14 @@ import { fileURLToPath } from 'url'
 import { lookupMarketBySlug as lookupMarket } from './predict-client.js'
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const ASSETS = (process.env.ASSETS || 'eth,btc,sol,xrp,doge,bnb').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-  const DURATIONS = ['5m', '15m']
+  const targets = parseConfiguredTargets()
 
   const watcher = startTwapWatcher({
     lookupMarketBySlug: lookupMarket,
-    assets: ASSETS,
-    durations: DURATIONS,
+    targets,
   })
 
   const shutdown = () => {
-    console.log("\n[twap-threshold] Shutting down...")
     if (watcher) watcher.stop()
     process.exit(0)
   }

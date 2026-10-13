@@ -69,8 +69,9 @@ PREDICT_ACCOUNT_ADDRESS=0x...
 # Predict.fun API Key (obtain from docs.predict.fun or dashboard)
 PREDICT_API_KEY=your_predict_api_key
 
-# ─── Target Assets & Durations ───────────────────────────────────────────────
-ASSETS=btc,eth,bnb,sol,xrp,doge
+# ─── Target Markets (Active Timestamp Only) ──────────────────────────────────
+# Targets the currently running candle round (e.g. btc-updown-5m, or btc-updown-15m)
+ASSETS=btc-updown-5m
 CANCEL_OPPOSITE_ON_FILL=true
 
 # ─── Bulk & Precautionary Cancellations ──────────────────────────────────────

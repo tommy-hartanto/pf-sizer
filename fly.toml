@@ -1,6 +1,6 @@
 # fly.toml — Predict.fun Sizer Bot (pf-sizer)
 app = "pf-sizer"
-primary_region = "ams"
+primary_region = "nrt"
 
 [build]
 
