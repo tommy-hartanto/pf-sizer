@@ -1,0 +1,17 @@
+# fly.toml — PM Sizer Bot
+app = "pm-sizer"
+primary_region = "ams"
+
+[build]
+
+[processes]
+  app = "node src/cleanup.js"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[[restart]]
+  policy = "always"
+  processes = ["app"]
+

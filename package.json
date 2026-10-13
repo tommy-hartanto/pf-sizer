@@ -1,0 +1,26 @@
+{
+  "name": "pf-sizer",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/cleanup.js",
+  "scripts": {
+    "start": "node src/cleanup.js",
+    "watch": "node src/fill-watcher.js",
+    "twap-watch": "node src/twap-watcher.js",
+    "fetch": "node src/fetch-orders.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "@polymarket/builder-signing-sdk": "^1.0.0",
+    "@polymarket/clob-client": "^5.8.1",
+    "@polymarket/clob-client-v2": "^1.0.0",
+    "dotenv": "^17.4.2",
+    "ethers": "^5.8.0",
+    "undici": "^7.25.0",
+    "ws": "^8.18.0"
+  }
+}
