@@ -12,14 +12,10 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Predict.fun order sizer, cancellation bot, and fill watcher",
   "dependencies": {
-    "@polymarket/builder-relayer-client": "^0.0.8",
-    "@polymarket/builder-signing-sdk": "^1.0.0",
-    "@polymarket/clob-client": "^5.8.1",
-    "@polymarket/clob-client-v2": "^1.0.0",
-    "dotenv": "^17.4.2",
-    "ethers": "^5.8.0",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
     "undici": "^7.25.0",
     "ws": "^8.18.0"
   }

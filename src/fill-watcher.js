@@ -1,278 +1,120 @@
 import 'dotenv/config'
-import { ClobClient } from '@polymarket/clob-client'
-import { Wallet } from 'ethers'
-import { request } from 'undici'
 import WebSocket from 'ws'
+import {
+  SIGNER_ADDRESS,
+  MAKER_ADDRESS,
+  IS_KERNEL,
+  WS_URL,
+  API_KEY,
+  getJwtToken,
+  fetchAllOpenOrders,
+  cancelOrders,
+  getMarketById
+} from './predict-client.js'
 
+// In-memory cache of orders: id -> { marketId, tokenId, side, amount, amountFilled, hash }
+const knownOrders = new Map()
 
-// --- Environment Setup ---
-const PRIVATE_KEY = process.env.PRIVATE_KEY
-const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || ''
+// Map of marketId -> market info
+const marketCache = new Map()
 
-if (!PRIVATE_KEY) {
-  console.error("Missing PRIVATE_KEY")
-  process.exit(1)
-}
-
-
-// Derive addresses
-const wallet = new Wallet(PRIVATE_KEY)
-const SIGNER_ADDRESS = wallet.address
-
-// Asset & duration configuration (same as cleanup.js)
-const ASSETS = (process.env.ASSETS || 'eth,btc,sol,xrp,doge,bnb,hype').split(',').map(s => s.trim()).filter(Boolean)
-const DURATIONS = ['5m', '15m']
-const SIZING_WINDOW_MS = 301000  // 5 minutes + 1 second
-
-// How often to refresh the market list (ms)
-const MARKET_REFRESH_INTERVAL_MS = 4 * 60 * 1000  // 4 minutes
-
-// Polymarket User WebSocket endpoint
-const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/user'
-
-// --- Shared CLOB Client (initialized once, reused) ---
-let clobClient = null
-let apiCreds = null
-
-// Map: conditionId -> { slug, tokens: [tokenId0, tokenId1] }
-let marketMap = {}
-
-// Set of conditionIds we are currently subscribed to
-let subscribedMarkets = new Set()
-
-
-// ─── CLOB Client Initialization ───────────────────────────────────────────────
-
-async function initClobClient() {
-  const SIGNATURE_TYPE = FUNDER_ADDRESS && SIGNER_ADDRESS.toLowerCase() !== FUNDER_ADDRESS.toLowerCase() ? 1 : 0
-
-  let creds = null
-  if (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_API_PASSPHRASE) {
-    creds = {
-      key: process.env.POLY_API_KEY,
-      secret: process.env.POLY_API_SECRET,
-      passphrase: process.env.POLY_API_PASSPHRASE,
-    }
-  }
-
-  let client = new ClobClient(
-    "https://clob.polymarket.com", 137, wallet,
-    creds || undefined, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined
-  )
-
-  if (!creds) {
-    console.log("[init] No CLOB API keys found. Deriving credentials via wallet...")
-    creds = await client.createOrDeriveApiKey()
-    client = new ClobClient(
-      "https://clob.polymarket.com", 137, wallet,
-      creds, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined
-    )
-  }
-
-  const keysResp = await client.getApiKeys().catch(e => e)
-  if (keysResp && (keysResp.error || keysResp instanceof Error)) {
-    console.log("[init] API key error, deriving new credentials...")
-    creds = await client.createOrDeriveApiKey()
-    client = new ClobClient(
-      "https://clob.polymarket.com", 137, wallet,
-      creds, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined
-    )
-  }
-
-  clobClient = client
-  apiCreds = creds
-  console.log("[init] CLOB client initialized.")
-}
-
-
-// ─── Market Discovery (same slug logic as cleanup.js) ─────────────────────────
-
-function generateUpcomingSlugs() {
-  const nowSec = Math.floor(Date.now() / 1000)
-  const windowEndSec = nowSec + Math.ceil(SIZING_WINDOW_MS / 1000)
-  const firstBoundary = Math.ceil(nowSec / 300) * 300
-
-  const timestamps = []
-  for (let ts = firstBoundary; ts <= windowEndSec; ts += 300) {
-    timestamps.push(ts)
-  }
-
-  const slugs = []
-  for (const asset of ASSETS) {
-    for (const duration of DURATIONS) {
-      for (const ts of timestamps) {
-        slugs.push(`${asset}-updown-${duration}-${ts}`)
-      }
-    }
-  }
-  return slugs
-}
-
-async function lookupMarketBySlug(slug) {
-  let retries = 3
-  while (retries > 0) {
-    try {
-      const res = await request(`https://gamma-api.polymarket.com/markets?slug=${slug}`, {
-        headersTimeout: 10000,
-        bodyTimeout: 10000,
-      })
-      if (res.statusCode === 200) {
-        const data = await res.body.json()
-        const market = Array.isArray(data) ? data[0] : data
-        if (!market || !market.conditionId) return null
-        let tokens = []
-        if (Array.isArray(market.clobTokenIds)) {
-          tokens = market.clobTokenIds
-        } else if (typeof market.clobTokenIds === 'string') {
-          try { tokens = JSON.parse(market.clobTokenIds) } catch { }
-        }
-        return {
-          conditionId: market.conditionId,
-          tokens,
-          slug: market.slug || slug,
-        }
-      }
-      await res.body.text()
-      if (res.statusCode === 429) {
-        await new Promise(r => setTimeout(r, 1500))
-        retries--
-      } else {
-        return null
-      }
-    } catch {
-      retries--
-      if (retries > 0) await new Promise(r => setTimeout(r, 1000))
-    }
-  }
-  return null
-}
-
-// Refreshes marketMap and returns the list of conditionIds found
-async function refreshMarkets() {
-  console.log(`\n[markets] Refreshing market list at ${new Date().toISOString()}`)
-  const slugs = generateUpcomingSlugs()
-  const newMarketMap = {}
-
-  for (const slug of slugs) {
-    const result = await lookupMarketBySlug(slug)
-    if (result && result.tokens.length >= 2) {
-      newMarketMap[result.conditionId] = {
-        slug: result.slug,
-        tokens: result.tokens,
-      }
-    }
-  }
-
-  const count = Object.keys(newMarketMap).length
-  console.log(`[markets] Found ${count} active market(s)`)
-
-  marketMap = newMarketMap
-  return Object.keys(newMarketMap)
-}
-
-
-// ─── Cancel Opposite Orders ────────────────────────────────────────────────────
-
-// Given a filled asset_id and conditionId, cancel all open orders for the OTHER asset_id.
-// Does NOT rely on marketMap — derives the opposite token directly from live orders.
-async function cancelOppositeOrders(conditionId, filledAssetId) {
-  // Fetch all open orders for this market
-  let orders = []
-  try {
-    const ordersRaw = await clobClient.getOpenOrders({ market: conditionId }).catch(e => e)
-    if (ordersRaw && (ordersRaw.error || ordersRaw instanceof Error)) {
-      console.error(`[cancel] Error fetching orders: ${ordersRaw.error || ordersRaw.message}`)
-      return
-    }
-    orders = Array.isArray(ordersRaw) ? ordersRaw : (ordersRaw.data || [])
-  } catch (e) {
-    console.error(`[cancel] Exception fetching orders: ${e.message}`)
-    return
-  }
-
-  // Cancel all orders that belong to a DIFFERENT asset_id than the one that was filled
-  const toCancel = orders
-    .filter(o => o.asset_id !== filledAssetId)
-    .map(o => o.id)
-
-  if (toCancel.length === 0) return
-
-  const slug = marketMap[conditionId]?.slug || conditionId.slice(0, 12) + '...'
-
-  try {
-    for (let i = 0; i < toCancel.length; i += 2000) {
-      const batch = toCancel.slice(i, i + 2000)
-      await clobClient.cancelOrders(batch)
-    }
-    console.log(`[cancel] ✓ [${slug}] Canceled ${toCancel.length} opposite-outcome order(s)`)
-  } catch (err) {
-    console.error(`[cancel] Error canceling orders: ${err.message}`)
-  }
-}
-
-
-// ─── WebSocket Connection ──────────────────────────────────────────────────────
+// How often to poll REST as a fallback/sync layer (ms)
+const POLL_SYNC_INTERVAL_MS = 30_000
 
 let ws = null
-let pingInterval = null
+let heartbeatCheckInterval = null
 let reconnectTimeout = null
 let isShuttingDown = false
 
-function buildSubscriptionMessage() {
-  // Omit 'markets' entirely → server sends events for ALL of the user's markets
-  return JSON.stringify({
-    auth: {
-      apiKey: apiCreds.key,
-      secret: apiCreds.secret,
-      passphrase: apiCreds.passphrase,
-    },
-    type: 'user',
-  })
+// ─── Order State Sync & Opposite Order Cancellation ──────────────────────────
+
+/**
+ * Syncs currently resting orders from REST API into in-memory map.
+ */
+async function syncOpenOrders() {
+  try {
+    const orders = await fetchAllOpenOrders()
+    const currentIds = new Set()
+
+    for (const item of orders) {
+      const id = String(item.id)
+      currentIds.add(id)
+      const order = item.order || {}
+      const prev = knownOrders.get(id)
+
+      const orderData = {
+        id,
+        marketId: String(item.marketId),
+        tokenId: order.tokenId,
+        side: order.side,
+        amount: item.amount,
+        amountFilled: item.amountFilled || '0',
+        hash: order.hash,
+      }
+
+      // Check if order was filled or partially filled since last sync
+      if (prev && BigInt(orderData.amountFilled) > BigInt(prev.amountFilled)) {
+        console.log(`\n[fill-watcher] 🔔 Fill detected via REST sync for Order ${id} (Market: ${orderData.marketId}, Token: ${orderData.tokenId.slice(0, 10)}...)`)
+        cancelOppositeOrders(orderData.marketId, orderData.tokenId).catch(err => {
+          console.error(`[fill-watcher] Error in cancelOppositeOrders: ${err.message}`)
+        })
+      }
+
+      knownOrders.set(id, orderData)
+    }
+
+    // Clean up orders that are no longer open
+    for (const [id, data] of knownOrders.entries()) {
+      if (!currentIds.has(id)) {
+        // If an order disappeared from open list and had not been marked cancelled, it might have filled
+        knownOrders.delete(id)
+      }
+    }
+  } catch (err) {
+    console.warn(`[fill-watcher] Order sync warning: ${err.message}`)
+  }
 }
 
-const filledSizes = new Map()
+/**
+ * Given a filled marketId and tokenId, cancel all remaining open orders for ANY OTHER tokenId in that market.
+ */
+export async function cancelOppositeOrders(marketId, filledTokenId) {
+  if (!marketId || !filledTokenId) return
 
-function handleMessage(rawData) {
-  let messages
+  let allOrders = []
   try {
-    const parsed = JSON.parse(rawData)
-    // The server may send a single object or an array
-    messages = Array.isArray(parsed) ? parsed : [parsed]
-  } catch {
-    // PONG or other non-JSON text
-    if (rawData === 'PONG') return
+    allOrders = await fetchAllOpenOrders()
+  } catch (err) {
+    console.error(`[fill-watcher] Error fetching orders during opposite cancel: ${err.message}`)
     return
   }
 
-  for (const msg of messages) {
-    if (msg.event_type === 'order') {
-      // We ONLY look at 'order' events, because 'trade' events can have the TAKER's asset_id at the top level.
-      // An 'order' event always belongs to OUR order, so its asset_id is unambiguously ours.
-      const sizeMatched = parseFloat(msg.size_matched || '0')
-      
-      if (sizeMatched > 0) {
-        // Track the size matched to prevent triggering cancel over and over for the same fill level
-        const lastSize = filledSizes.get(msg.id) || 0
-        if (sizeMatched > lastSize) {
-          filledSizes.set(msg.id, sizeMatched)
-          
-          const conditionId = msg.market
-          const filledAssetId = msg.asset_id
-          if (!conditionId || !filledAssetId) continue
-          
-          const slug = marketMap[conditionId]?.slug || conditionId.slice(0, 12) + '...'
-          console.log(`\n[ws] 🔔 ORDER FILL [${slug}] asset=${filledAssetId.slice(0,12)}... matched=${msg.size_matched}/${msg.original_size} price=${msg.price}`)
-          
-          cancelOppositeOrders(conditionId, filledAssetId).catch(err => {
-            console.error(`[ws] cancelOppositeOrders error: ${err.message}`)
-          })
-        }
-      }
-    }
+  const marketOrders = allOrders.filter(o => String(o.marketId) === String(marketId))
+  const oppositeOrders = marketOrders.filter(o => o.order && o.order.tokenId && o.order.tokenId !== filledTokenId)
+
+  if (oppositeOrders.length === 0) return
+
+  const toCancelIds = oppositeOrders.map(o => o.id)
+  let marketInfo = marketCache.get(String(marketId))
+  if (!marketInfo) {
+    marketInfo = await getMarketById(marketId).catch(() => null)
+    if (marketInfo) marketCache.set(String(marketId), marketInfo)
+  }
+
+  const label = marketInfo?.slug || `Market ${marketId}`
+  console.log(`\n[fill-watcher] ⚡ [${label}] CANCELLATION TRIGGERED: ${toCancelIds.length} opposite-outcome order(s)`)
+
+  try {
+    await cancelOrders(toCancelIds)
+    console.log(`[fill-watcher] ✓ [${label}] Successfully canceled ${toCancelIds.length} opposite order(s)!`)
+  } catch (err) {
+    console.error(`[fill-watcher] Failed to cancel opposite orders: ${err.message}`)
   }
 }
 
-function connect() {
+// ─── WebSocket Connection & Protocol ─────────────────────────────────────────
+
+async function connectWs() {
   if (isShuttingDown) return
 
   if (ws) {
@@ -280,102 +122,161 @@ function connect() {
     ws.terminate()
     ws = null
   }
-  if (pingInterval) {
-    clearInterval(pingInterval)
-    pingInterval = null
+
+  let jwt = null
+  try {
+    jwt = await getJwtToken()
+  } catch (err) {
+    console.error(`[fill-watcher] Failed to get JWT token: ${err.message}. Retrying in 5s...`)
+    reconnectTimeout = setTimeout(connectWs, 5000)
+    return
   }
 
-  console.log(`\n[ws] Connecting to ${WS_URL}...`)
-  ws = new WebSocket(WS_URL)
+  const url = WS_URL + (API_KEY ? `?apiKey=${API_KEY}` : '')
+  console.log(`[fill-watcher] Connecting to Predict.fun WebSocket (${WS_URL})...`)
 
-  ws.on('open', () => {
-    console.log('[ws] Connected. Subscribed to all user events.')
-    ws.send(buildSubscriptionMessage())
-
-    // Send PING every 10 seconds to keep connection alive
-    pingInterval = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send('PING')
-      }
-    }, 10000)
+  ws = new WebSocket(url, {
+    headers: {
+      ...(API_KEY ? { 'x-api-key': API_KEY } : {}),
+      'User-Agent': 'pf-sizer/2.0',
+    },
   })
 
-  ws.on('message', (data) => {
-    handleMessage(data.toString())
+  ws.on('open', () => {
+    console.log('[fill-watcher] WebSocket connected. Subscribing to predictWalletEvents...')
+    const topic = `predictWalletEvents/${jwt}`
+    const subMsg = JSON.stringify({
+      requestId: Date.now(),
+      method: 'subscribe',
+      params: [topic]
+    })
+    ws.send(subMsg)
+  })
+
+  ws.on('message', async (data) => {
+    const raw = data.toString()
+    if (!raw) return
+
+    // Heartbeat check / echo
+    if (raw.includes('"heartbeat"')) {
+      try {
+        const parsed = JSON.parse(raw)
+        const ts = parsed.data || Date.now()
+        ws.send(JSON.stringify({ method: 'heartbeat', data: ts }))
+      } catch {}
+      return
+    }
+
+    if (raw === 'PONG' || raw === 'pong') return
+
+    try {
+      const msg = JSON.parse(raw)
+
+      // Handle subscription acknowledgement
+      if (msg.type === 'R' && msg.success) {
+        console.log('[fill-watcher] ✓ Subscribed to user wallet events successfully.')
+        return
+      }
+
+      // Check for wallet events
+      const payload = msg.data || msg
+      const eventType = payload.type || payload.event_type || payload.event || ''
+
+      // Order fill events
+      if (
+        eventType === 'OrderTransactionSuccess' ||
+        eventType === 'OrderTransactionSubmitted' ||
+        eventType === 'OrderMatched' ||
+        eventType === 'Trade' ||
+        eventType === 'Fill'
+      ) {
+        const orderId = String(payload.order_id || payload.orderId || payload.id || '')
+        const orderHash = payload.order_hash || payload.orderHash || ''
+        console.log(`\n[fill-watcher] 🔔 EVENT RECEIVED: [${eventType}] Order ID: ${orderId || 'N/A'}, Hash: ${orderHash || 'N/A'}`)
+
+        // Identify which order filled
+        let targetOrder = null
+        if (orderId && knownOrders.has(orderId)) {
+          targetOrder = knownOrders.get(orderId)
+        } else if (orderHash) {
+          for (const ord of knownOrders.values()) {
+            if (ord.hash === orderHash) {
+              targetOrder = ord
+              break
+            }
+          }
+        }
+
+        // If not found in memory, refresh orders and search
+        if (!targetOrder) {
+          await syncOpenOrders()
+          if (orderId && knownOrders.has(orderId)) {
+            targetOrder = knownOrders.get(orderId)
+          }
+        }
+
+        if (targetOrder) {
+          await cancelOppositeOrders(targetOrder.marketId, targetOrder.tokenId)
+        } else {
+          // If we couldn't match the specific order ID, trigger a general orderbook audit
+          console.log('[fill-watcher] Order not in local cache; triggering sync to check for fills...')
+          await syncOpenOrders()
+        }
+      }
+    } catch {}
   })
 
   ws.on('error', (err) => {
-    console.error(`[ws] Error: ${err.message}`)
+    console.warn(`[fill-watcher] WebSocket error: ${err.message}`)
   })
 
   ws.on('close', (code, reason) => {
-    console.log(`[ws] Disconnected (code=${code}, reason=${reason}). Reconnecting in 5s...`)
-    if (pingInterval) { clearInterval(pingInterval); pingInterval = null }
+    console.log(`[fill-watcher] WebSocket disconnected (code=${code}). Reconnecting in 5s...`)
     if (!isShuttingDown) {
-      reconnectTimeout = setTimeout(() => connect(), 5000)
+      reconnectTimeout = setTimeout(connectWs, 5000)
     }
   })
 }
 
-// ─── Main Loop ─────────────────────────────────────────────────────────────────
+// ─── Main Watcher Lifecycle ──────────────────────────────────────────────────
 
 export async function startWatcher() {
-  console.log("PM Fill Watcher — Cancel Opposite on Fill")
-  console.log(`Signer: ${SIGNER_ADDRESS}`)
-  console.log(`Assets: ${ASSETS.join(', ')}`)
-  console.log(`Durations: ${DURATIONS.join(', ')}`)
+  console.log("Predict.fun Fill Watcher — Cancel Opposite on Fill")
+  console.log(`Signer:        ${SIGNER_ADDRESS}`)
+  console.log(`Account/Maker: ${MAKER_ADDRESS}`)
+  console.log(`Smart Account: ${IS_KERNEL ? 'ZeroDev Kernel' : 'EOA'}`)
 
-  // Initialize CLOB client
-  try {
-    await initClobClient()
-  } catch (err) {
-    console.error("[start] Failed to initialize CLOB client:", err.message)
-    process.exit(1)
+  // Initial orders snapshot
+  await syncOpenOrders()
+  console.log(`[fill-watcher] Initialized order cache with ${knownOrders.size} open order(s).`)
+
+  // Connect WebSocket
+  await connectWs()
+
+  // Periodic fallback REST sync
+  setInterval(syncOpenOrders, POLL_SYNC_INTERVAL_MS)
+}
+
+function setupShutdown() {
+  const shutdown = () => {
+    console.log("\n[fill-watcher] Shutting down...")
+    isShuttingDown = true
+    if (reconnectTimeout) clearTimeout(reconnectTimeout)
+    if (heartbeatCheckInterval) clearInterval(heartbeatCheckInterval)
+    if (ws) ws.close()
+    process.exit(0)
   }
 
-  // Initial market discovery (populates marketMap for logs)
-  await refreshMarkets()
-
-  // Start WebSocket (subscribes to ALL user events globally)
-  connect()
-
-  // Periodically refresh market list so logs have the right slugs
-  setInterval(async () => {
-    try {
-      await refreshMarkets()
-    } catch (err) {
-      console.error("[refresh] Error refreshing markets:", err.message)
-    }
-  }, MARKET_REFRESH_INTERVAL_MS)
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 }
 
-// Graceful shutdown
-function setupShutdown() {
-  process.on('SIGINT', () => {
-    console.log("\n[shutdown] SIGINT received. Closing...")
-    isShuttingDown = true
-    if (pingInterval) clearInterval(pingInterval)
-    if (reconnectTimeout) clearTimeout(reconnectTimeout)
-    if (ws) ws.close()
-    process.exit(0)
-  })
-
-  process.on('SIGTERM', () => {
-    console.log("\n[shutdown] SIGTERM received. Closing...")
-    isShuttingDown = true
-    if (pingInterval) clearInterval(pingInterval)
-    if (reconnectTimeout) clearTimeout(reconnectTimeout)
-    if (ws) ws.close()
-    process.exit(0)
-  })
-}
-
-// If run directly
+// Standalone execution
 import { fileURLToPath } from 'url'
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   setupShutdown()
   startWatcher().catch(err => {
-    console.error("[fatal]", err)
+    console.error("[fill-watcher] Fatal error:", err)
     process.exit(1)
   })
 }

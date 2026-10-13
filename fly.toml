@@ -1,5 +1,5 @@
-# fly.toml — PM Sizer Bot
-app = "pm-sizer"
+# fly.toml — Predict.fun Sizer Bot (pf-sizer)
+app = "pf-sizer"
 primary_region = "ams"
 
 [build]
@@ -14,4 +14,3 @@ primary_region = "ams"
 [[restart]]
   policy = "always"
   processes = ["app"]
-

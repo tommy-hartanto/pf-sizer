@@ -2,17 +2,14 @@ import 'dotenv/config'
 import dns from 'dns'
 import https from 'https'
 import WebSocket from 'ws'
-import { createL2Headers } from '@polymarket/clob-client'
-import { request } from 'undici'
+import { cancelOrders, fetchAllOpenOrders } from './predict-client.js'
 
 // ─── DoH (DNS over HTTPS) Helper ─────────────────────────────────────────────
-// Resolves hostnames via Cloudflare DoH to bypass regional DNS blocks/poisoning.
 const dnsCache = new Map()
 
 export async function resolveDoH(hostname) {
   if (dnsCache.has(hostname)) return dnsCache.get(hostname)
 
-  // Direct IP address check
   if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) {
     return hostname
   }
@@ -57,25 +54,22 @@ export function customDohLookup(hostname, options, callback) {
 }
 
 // ─── Constants & Configuration ───────────────────────────────────────────────
-const RTDS_WS_URL = 'wss://ws-live-data.polymarket.com'
-const DEFAULT_ASSETS = ['eth', 'btc', 'sol', 'xrp', 'doge', 'bnb', 'hype']
+const BINANCE_WS_HOST = 'data-stream.binance.vision'
+const DEFAULT_ASSETS = ['eth', 'btc', 'sol', 'xrp', 'doge', 'bnb']
 const DEFAULT_DURATIONS = ['5m', '15m']
 
-// In-memory state
-// latestPrices[asset] = { twap30s, twap60s, spot, lastUpdateMs }
+// In-memory price state
+// latestPrices[asset] = { spot, twap30s, twap60s, lastUpdateMs }
 const latestPrices = new Map()
 
-// twapHistory[asset][window] = array of { ts: epochSeconds, price }
-const twapHistory = new Map()
+// priceHistory[asset] = array of { ts: epochSeconds, price }
+const priceHistory = new Map()
 
 // marketOpenPrices: slug -> openPrice (float)
 const marketOpenPrices = new Map()
 
 // triggeredSlugs: Set of slugs whose orders were already canceled this window
 const triggeredSlugs = new Set()
-
-// Cache for market lookup by slug: slug -> { conditionId, tokens, slug }
-const marketCache = new Map()
 
 /**
  * Reads configured percentage threshold for an asset (e.g. CANCEL_THRES_BTC=0.3).
@@ -118,7 +112,29 @@ export function getTwapStatus() {
 }
 
 /**
- * Returns effective TWAP for an asset given market duration.
+ * Calculates TWAP over a window in seconds from historical price ticks.
+ */
+function calculateTwap(asset, windowSec, nowSec) {
+  const sym = asset.toLowerCase()
+  const list = priceHistory.get(sym)
+  if (!list || list.length === 0) return null
+
+  const cutoff = nowSec - windowSec
+  let sum = 0
+  let count = 0
+
+  for (let i = list.length - 1; i >= 0; i--) {
+    const item = list[i]
+    if (item.ts < cutoff) break
+    sum += item.price
+    count++
+  }
+
+  return count > 0 ? sum / count : null
+}
+
+/**
+ * Returns effective TWAP or spot price for an asset given market duration.
  * 5m markets resolve on 30s TWAP (or spot fallback).
  * 15m markets resolve on 60s TWAP (or 30s / spot fallback).
  */
@@ -127,55 +143,50 @@ export function getEffectiveTwap(asset, duration) {
   const data = latestPrices.get(sym)
   if (!data) return null
 
+  const nowSec = Math.floor(Date.now() / 1000)
   if (duration === '5m') {
-    return data.twap30s ?? data.spot ?? null
+    return calculateTwap(sym, 30, nowSec) ?? data.spot ?? null
   } else {
-    return data.twap60s ?? data.twap30s ?? data.spot ?? null
+    return calculateTwap(sym, 60, nowSec) ?? calculateTwap(sym, 30, nowSec) ?? data.spot ?? null
   }
 }
 
 /**
- * Records a TWAP price tick into latest state and historical ring buffer.
+ * Records a price tick into latest state and historical ring buffer.
  */
-function recordTwapTick(asset, window, value, tsMs) {
+function recordPriceTick(asset, price, tsMs) {
   const sym = asset.toLowerCase()
   const tsSec = Math.floor(tsMs / 1000)
 
   if (!latestPrices.has(sym)) {
-    latestPrices.set(sym, { twap30s: null, twap60s: null, spot: null, lastUpdateMs: tsMs })
+    latestPrices.set(sym, { spot: price, twap30s: null, twap60s: null, lastUpdateMs: tsMs })
   }
   const current = latestPrices.get(sym)
+  current.spot = price
   current.lastUpdateMs = tsMs
 
-  if (window === 30) current.twap30s = value
-  else if (window === 60) current.twap60s = value
-  else if (window === 0) current.spot = value
-
-  // Push to history
-  if (!twapHistory.has(sym)) twapHistory.set(sym, {})
-  const assetHist = twapHistory.get(sym)
-  if (!assetHist[window]) assetHist[window] = []
-
-  const list = assetHist[window]
-  list.push({ ts: tsSec, price: value })
+  if (!priceHistory.has(sym)) priceHistory.set(sym, [])
+  const list = priceHistory.get(sym)
+  list.push({ ts: tsSec, price })
 
   // Prune history older than 35 minutes (2100s)
   const cutoff = tsSec - 2100
   while (list.length > 0 && list[0].ts < cutoff) {
     list.shift()
   }
+
+  current.twap30s = calculateTwap(sym, 30, tsSec)
+  current.twap60s = calculateTwap(sym, 60, tsSec)
 }
 
 /**
- * Finds historical TWAP price at or closest to a specific timestamp.
+ * Finds historical price at or closest to a specific timestamp.
  */
-function findHistoricalTwap(asset, window, targetTsSec) {
+function findHistoricalPrice(asset, targetTsSec) {
   const sym = asset.toLowerCase()
-  const assetHist = twapHistory.get(sym)
-  if (!assetHist || !assetHist[window] || assetHist[window].length === 0) return null
+  const list = priceHistory.get(sym)
+  if (!list || list.length === 0) return null
 
-  const list = assetHist[window]
-  // Find tick at or immediately preceding targetTsSec
   let best = null
   let minDiff = Infinity
 
@@ -191,73 +202,9 @@ function findHistoricalTwap(asset, window, targetTsSec) {
 }
 
 /**
- * Market lookup via Gamma API with caching.
- */
-async function lookupMarket(slug, customLookupFn) {
-  if (marketCache.has(slug)) return marketCache.get(slug)
-  if (customLookupFn) {
-    const res = await customLookupFn(slug)
-    if (res) {
-      marketCache.set(slug, res)
-      return res
-    }
-  }
-
-  // Fallback direct request
-  try {
-    const res = await request(`https://gamma-api.polymarket.com/markets?slug=${slug}`)
-    if (res.statusCode === 200) {
-      const data = await res.body.json()
-      const m = Array.isArray(data) ? data[0] : data
-      if (m && m.conditionId) {
-        let tokens = []
-        if (Array.isArray(m.clobTokenIds)) tokens = m.clobTokenIds
-        else if (typeof m.clobTokenIds === 'string') {
-          try { tokens = JSON.parse(m.clobTokenIds) } catch {}
-        }
-        const info = { conditionId: m.conditionId, tokens, slug: m.slug || slug }
-        marketCache.set(slug, info)
-        return info
-      }
-    } else {
-      await res.body.text()
-    }
-  } catch {}
-
-  return null
-}
-
-/**
- * Fetches all open orders for a specific market condition ID from Polymarket CLOB.
- */
-async function fetchOpenOrdersForMarket(conditionId, wallet, creds) {
-  try {
-    const l2Args = { method: 'GET', requestPath: '/data/orders' }
-    const headers = await createL2Headers(wallet, creds, l2Args)
-    const res = await request(
-      `https://clob.polymarket.com/data/orders?market=${conditionId}`,
-      { method: 'GET', headers, headersTimeout: 10000, bodyTimeout: 10000 }
-    )
-    if (res.statusCode === 200) {
-      const json = await res.body.json()
-      return Array.isArray(json) ? json : (json?.data || [])
-    } else {
-      await res.body.text()
-      return []
-    }
-  } catch (err) {
-    console.error(`[twap-threshold] Error fetching orders for ${conditionId.slice(0, 10)}...: ${err.message}`)
-    return []
-  }
-}
-
-/**
- * Main watcher loop: checks active markets and cancels orders if TWAP delta exceeds threshold.
+ * Evaluates active markets and cancels orders if TWAP delta exceeds threshold.
  */
 async function checkThresholdsForActiveMarkets({
-  clobClient,
-  wallet,
-  creds,
   lookupMarketBySlug,
   assets,
   durations,
@@ -266,15 +213,12 @@ async function checkThresholdsForActiveMarkets({
 
   for (const asset of assets) {
     const threshold = getThreshold(asset)
-    if (threshold === null) continue // No threshold configured for this asset
+    if (threshold === null) continue
 
     for (const duration of durations) {
       const durationSec = duration === '5m' ? 300 : 900
-      const windowSec = duration === '5m' ? 30 : 60
 
-      // Scan currently active windows for this duration:
-      // A market is active if startTs <= nowSec < startTs + durationSec
-      // Check 5-minute boundaries going back durationSec
+      // Active window check
       const currentBoundary = Math.floor(nowSec / 300) * 300
       const startFrom = currentBoundary - durationSec + 300
 
@@ -283,17 +227,13 @@ async function checkThresholdsForActiveMarkets({
         if (nowSec < startTs || nowSec >= endTime) continue
 
         const slug = `${asset}-updown-${duration}-${startTs}`
-
-        // If already triggered and canceled for this window, skip
         if (triggeredSlugs.has(slug)) continue
 
-        // 1. Determine open price for this market window
+        // 1. Determine open price for this market
         let openPrice = marketOpenPrices.get(slug)
         if (!openPrice) {
-          // Check historical ticks around startTs
-          openPrice = findHistoricalTwap(asset, windowSec, startTs)
+          openPrice = findHistoricalPrice(asset, startTs)
           if (!openPrice) {
-            // If historical tick not found, use current effective TWAP if we are near market start
             openPrice = getEffectiveTwap(asset, duration)
           }
 
@@ -305,42 +245,42 @@ async function checkThresholdsForActiveMarkets({
 
         if (!openPrice || openPrice <= 0) continue
 
-        // 2. Get current live TWAP
+        // 2. Get current live price / TWAP
         const currentTwap = getEffectiveTwap(asset, duration)
         if (!currentTwap || currentTwap <= 0) continue
 
-        // 3. Compute absolute percentage delta against open price
+        // 3. Compute percentage delta
         const deltaPercent = Math.abs((currentTwap - openPrice) / openPrice) * 100
 
-        // 4. Check if delta exceeds threshold
+        // 4. Check if breached
         if (deltaPercent >= threshold) {
           triggeredSlugs.add(slug)
 
           console.log(`\n═══════════════════════════════════════════════════════════════════`)
           console.log(`[twap-threshold] 🚨 BREACH DETECTED for [${slug}]!`)
-          console.log(`  Current TWAP: $${currentTwap.toFixed(4)}`)
-          console.log(`  Open Price:   $${openPrice.toFixed(4)}`)
-          console.log(`  Delta:        ${deltaPercent.toFixed(4)}% >= Threshold: ${threshold}%`)
-          console.log(`  Action:       Canceling ALL open orders for market...`)
+          console.log(`  Current TWAP/Spot: $${currentTwap.toFixed(4)}`)
+          console.log(`  Open Price:        $${openPrice.toFixed(4)}`)
+          console.log(`  Delta:             ${deltaPercent.toFixed(4)}% >= Threshold: ${threshold}%`)
+          console.log(`  Action:            Canceling ALL open orders for market on Predict.fun...`)
           console.log(`═══════════════════════════════════════════════════════════════════`)
 
           try {
-            const market = await lookupMarket(slug, lookupMarketBySlug)
-            if (!market) {
-              console.warn(`[twap-threshold] Could not resolve market conditionId for ${slug}`)
+            const market = await lookupMarketBySlug(slug)
+            if (!market || !market.marketId) {
+              console.warn(`[twap-threshold] Could not resolve market ID for ${slug}`)
               continue
             }
 
-            const orders = await fetchOpenOrdersForMarket(market.conditionId, wallet, creds)
-            if (orders.length === 0) {
+            const allOrders = await fetchAllOpenOrders()
+            const marketOrders = allOrders.filter(o => String(o.marketId) === String(market.marketId))
+
+            if (marketOrders.length === 0) {
               console.log(`[twap-threshold] [${slug}] 0 open orders found.`)
               continue
             }
 
-            const ids = orders.map(o => o.id)
-            for (let i = 0; i < ids.length; i += 2000) {
-              await clobClient.cancelOrders(ids.slice(i, i + 2000))
-            }
+            const ids = marketOrders.map(o => o.id)
+            const result = await cancelOrders(ids)
             console.log(`[twap-threshold] ✓ [${slug}] Successfully canceled all ${ids.length} open order(s)!`)
           } catch (cancelErr) {
             console.error(`[twap-threshold] Error canceling orders for ${slug}: ${cancelErr.message}`)
@@ -350,7 +290,7 @@ async function checkThresholdsForActiveMarkets({
     }
   }
 
-  // Periodic cleanup of expired market state (markets that ended > 60s ago)
+  // Periodic cleanup of expired market state
   for (const [slug] of marketOpenPrices.entries()) {
     const parts = slug.split('-')
     const startTs = parseInt(parts[parts.length - 1], 10)
@@ -359,135 +299,83 @@ async function checkThresholdsForActiveMarkets({
     if (!isNaN(startTs) && nowSec >= startTs + durationSec + 60) {
       marketOpenPrices.delete(slug)
       triggeredSlugs.delete(slug)
-      marketCache.delete(slug)
     }
   }
 }
 
-// ─── WebSocket Client for Polymarket RTDS ────────────────────────────────────
-let rtdsWs = null
+// ─── WebSocket Client for Binance Spot Price Stream ──────────────────────────
+let binanceWs = null
 let pingInterval = null
 let reconnectTimeout = null
 let checkInterval = null
 let isShuttingDown = false
 
 export function startTwapWatcher({
-  clobClient,
-  wallet,
-  creds,
   lookupMarketBySlug,
   assets = DEFAULT_ASSETS,
   durations = DEFAULT_DURATIONS,
 }) {
-  // Check if any threshold is configured
   const configuredAssets = assets.filter(a => getThreshold(a) !== null)
   if (configuredAssets.length === 0) {
     console.log("[twap-threshold] No CANCEL_THRES_* variables configured. Watcher inactive.")
     return { stop: () => {} }
   }
 
-  console.log(`[twap-threshold] 🚀 Initializing TWAP Threshold Watcher...`)
+  console.log(`[twap-threshold] 🚀 Initializing TWAP Threshold Watcher via Binance Spot Stream...`)
   for (const a of configuredAssets) {
     console.log(`  └─ ${a.toUpperCase()}: threshold = ${getThreshold(a)}%`)
   }
 
-  const effectiveCreds = creds || clobClient.creds
+  const streams = assets.map(a => `${a.toLowerCase()}usdt@ticker`).join('/')
+  const streamUrl = `wss://${BINANCE_WS_HOST}:9443/stream?streams=${streams}`
 
   function connect() {
     if (isShuttingDown) return
 
-    if (rtdsWs) {
-      rtdsWs.removeAllListeners()
-      rtdsWs.terminate()
-      rtdsWs = null
+    if (binanceWs) {
+      binanceWs.removeAllListeners()
+      binanceWs.terminate()
+      binanceWs = null
     }
     if (pingInterval) clearInterval(pingInterval)
 
-    rtdsWs = new WebSocket(RTDS_WS_URL, {
+    binanceWs = new WebSocket(streamUrl, {
       lookup: customDohLookup,
-      servername: 'ws-live-data.polymarket.com',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Origin': 'https://polymarket.com',
+        'User-Agent': 'pf-sizer/2.0',
       },
     })
 
-    rtdsWs.on('open', () => {
-      console.log('[twap-threshold] Connected to Polymarket RTDS WebSocket.')
-      const subMsg = {
-        action: 'subscribe',
-        subscriptions: [
-          { topic: 'crypto_prices_twap_thirty', type: 'update' },
-          { topic: 'crypto_prices_twap_sixty', type: 'update' },
-          { topic: 'crypto_prices_chainlink', type: 'update' },
-        ],
-      }
-      rtdsWs.send(JSON.stringify(subMsg))
-
-      // Keepalive PING every 5 seconds (Polymarket RTDS requires plain text "ping")
-      pingInterval = setInterval(() => {
-        if (rtdsWs && rtdsWs.readyState === WebSocket.OPEN) {
-          rtdsWs.send('ping')
-        }
-      }, 5000)
+    binanceWs.on('open', () => {
+      console.log(`[twap-threshold] Connected to Binance Spot WS stream (tracking: ${assets.join(', ')}).`)
     })
 
-    rtdsWs.on('message', (data) => {
-      const text = data.toString()
-      const clean = text.trim().toLowerCase()
-      if (clean === 'pong' || clean === 'ping' || !clean) return
-
+    binanceWs.on('message', (data) => {
       try {
-        const msg = JSON.parse(text)
-        const topic = msg.topic
-        if (!topic) return
+        const msg = JSON.parse(data.toString())
+        const payload = msg.data || msg
+        const rawSymbol = payload.s || ''
+        if (!rawSymbol.endsWith('USDT')) return
 
-        let window = 0
-        if (topic.includes('twap_thirty')) window = 30
-        else if (topic.includes('twap_sixty')) window = 60
-        else if (topic.includes('chainlink')) window = 0
-        else return
+        const sym = rawSymbol.slice(0, -4).toLowerCase()
+        const priceStr = payload.c
+        if (!priceStr) return
 
-        const payload = msg.payload
-        if (!payload) return
+        const price = parseFloat(priceStr)
+        if (isNaN(price)) return
 
-        const items = Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : [payload])
-
-        for (const item of items) {
-          if (!item || typeof item !== 'object') continue
-          const rawSym = (item.symbol || '').toUpperCase()
-          if (!rawSym) continue
-
-          const baseSym = rawSym
-            .replace(/\/USD$/, '')
-            .replace(/USDT$/, '')
-            .replace(/-USD$/, '')
-            .replace(/\/USDT$/, '')
-            .toLowerCase()
-
-          if (!assets.includes(baseSym)) continue
-
-          const val = item.value
-          if (val === null || val === undefined) continue
-          const valFloat = parseFloat(val)
-          if (isNaN(valFloat)) continue
-
-          const tsMs = item.timestamp || msg.timestamp || Date.now()
-          recordTwapTick(baseSym, window, valFloat, tsMs)
-        }
-      } catch (e) {
-        // Ignore unparseable non-JSON messages
-      }
+        const tsMs = payload.E || Date.now()
+        recordPriceTick(sym, price, tsMs)
+      } catch {}
     })
 
-    rtdsWs.on('error', (err) => {
-      if (!isShuttingDown) console.warn(`[twap-threshold] RTDS WS error: ${err.message}`)
+    binanceWs.on('error', (err) => {
+      if (!isShuttingDown) console.warn(`[twap-threshold] Binance WS error: ${err.message}`)
     })
 
-    rtdsWs.on('close', (code, reason) => {
-      if (pingInterval) clearInterval(pingInterval)
+    binanceWs.on('close', (code) => {
       if (!isShuttingDown) {
-        console.log(`[twap-threshold] RTDS WS disconnected (${code}). Reconnecting in 3s...`)
+        console.log(`[twap-threshold] Binance WS disconnected (${code}). Reconnecting in 3s...`)
         reconnectTimeout = setTimeout(connect, 3000)
       }
     })
@@ -495,12 +383,9 @@ export function startTwapWatcher({
 
   connect()
 
-  // High-frequency threshold checker (evaluates every 1 second)
+  // Evaluate every 1 second
   checkInterval = setInterval(() => {
     checkThresholdsForActiveMarkets({
-      clobClient,
-      wallet,
-      creds: effectiveCreds,
       lookupMarketBySlug,
       assets,
       durations,
@@ -510,79 +395,33 @@ export function startTwapWatcher({
   return {
     stop: () => {
       isShuttingDown = true
-      if (pingInterval) clearInterval(pingInterval)
       if (reconnectTimeout) clearTimeout(reconnectTimeout)
       if (checkInterval) clearInterval(checkInterval)
-      if (rtdsWs) rtdsWs.close()
+      if (binanceWs) binanceWs.close()
     },
   }
 }
 
 // ─── Standalone CLI Runner ───────────────────────────────────────────────────
 import { fileURLToPath } from 'url'
-import { Wallet } from 'ethers'
-import { ClobClient } from '@polymarket/clob-client'
+import { lookupMarketBySlug as lookupMarket } from './predict-client.js'
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const PRIVATE_KEY = process.env.PRIVATE_KEY
-  const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || ''
+  const ASSETS = (process.env.ASSETS || 'eth,btc,sol,xrp,doge,bnb').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  const DURATIONS = ['5m', '15m']
 
-  if (!PRIVATE_KEY) {
-    console.error("Missing PRIVATE_KEY")
-    process.exit(1)
-  }
-
-  const wallet = new Wallet(PRIVATE_KEY)
-  const SIGNER_ADDRESS = wallet.address
-  const SIGNATURE_TYPE = FUNDER_ADDRESS && SIGNER_ADDRESS.toLowerCase() !== FUNDER_ADDRESS.toLowerCase() ? 1 : 0
-
-  async function runStandalone() {
-    console.log("PM Sizer — Real-Time TWAP Threshold Watcher (Standalone)")
-    console.log(`Signer: ${SIGNER_ADDRESS}`)
-
-    let creds = null
-    if (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_API_PASSPHRASE) {
-      creds = {
-        key: process.env.POLY_API_KEY,
-        secret: process.env.POLY_API_SECRET,
-        passphrase: process.env.POLY_API_PASSPHRASE,
-      }
-    }
-
-    let client = new ClobClient("https://clob.polymarket.com", 137, wallet, creds || undefined, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined)
-
-    if (!creds) {
-      console.log("Deriving credentials via wallet...")
-      creds = await client.createOrDeriveApiKey()
-      client = new ClobClient("https://clob.polymarket.com", 137, wallet, creds, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined)
-    }
-
-    const { lookupMarketBySlug } = await import('./cleanup.js').catch(() => ({ lookupMarketBySlug: null }))
-
-    const ASSETS = (process.env.ASSETS || 'eth,btc,sol,xrp,doge,bnb,hype').split(',').map(s => s.trim()).filter(Boolean)
-    const DURATIONS = ['5m', '15m']
-
-    const watcher = startTwapWatcher({
-      clobClient: client,
-      wallet,
-      creds,
-      lookupMarketBySlug,
-      assets: ASSETS,
-      durations: DURATIONS,
-    })
-
-    const shutdown = () => {
-      console.log("\n[twap-threshold] Shutting down...")
-      if (watcher) watcher.stop()
-      process.exit(0)
-    }
-
-    process.on('SIGINT', shutdown)
-    process.on('SIGTERM', shutdown)
-  }
-
-  runStandalone().catch(err => {
-    console.error("[twap-threshold] Fatal:", err)
-    process.exit(1)
+  const watcher = startTwapWatcher({
+    lookupMarketBySlug: lookupMarket,
+    assets: ASSETS,
+    durations: DURATIONS,
   })
+
+  const shutdown = () => {
+    console.log("\n[twap-threshold] Shutting down...")
+    if (watcher) watcher.stop()
+    process.exit(0)
+  }
+
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 }

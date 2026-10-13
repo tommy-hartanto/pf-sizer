@@ -1,29 +1,25 @@
 import 'dotenv/config'
-import { ClobClient, createL2Headers } from '@polymarket/clob-client'
-import { Wallet } from 'ethers'
-import { request } from 'undici'
+import {
+  SIGNER_ADDRESS,
+  MAKER_ADDRESS,
+  IS_KERNEL,
+  lookupMarketBySlug,
+  fetchAllOpenOrders,
+  cancelOrders,
+  getMarketById,
+  authenticate
+} from './predict-client.js'
 import { startWatcher } from './fill-watcher.js'
 import { startTwapWatcher, isTwapThresholdBreached, getThreshold } from './twap-watcher.js'
 
+// ─── Environment & Tuning Constants ──────────────────────────────────────────
+const SIZING_WINDOW_MS = 301000 // 5 minutes + 1 second
 
-// --- Environment Setup ---
-const PRIVATE_KEY = process.env.PRIVATE_KEY
-const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS || ''
+const ASSETS = (process.env.ASSETS || 'eth,btc,sol,xrp,doge,bnb')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean)
 
-if (!PRIVATE_KEY) {
-  console.error("Missing PRIVATE_KEY")
-  process.exit(1)
-}
-
-// Derive addresses
-const wallet = new Wallet(PRIVATE_KEY)
-const SIGNER_ADDRESS = wallet.address
-
-// Tuning constants
-const SIZING_WINDOW_MS = 301000          // 5 minutes + 1 second
-
-// Asset & duration configuration
-const ASSETS = (process.env.ASSETS || 'eth,btc,sol,xrp,doge,bnb,hype').split(',').map(s => s.trim()).filter(Boolean)
 const DURATIONS = ['5m', '15m']
 const DELETE_ALL_ORDERS = process.env.DELETE_ALL_ORDERS === 'true'
 const DELETE_ALL_SLUGS = (process.env.DELETE_ALL_SLUGS || '').split(',').map(s => s.trim()).filter(Boolean)
@@ -31,8 +27,9 @@ const DELETE_ALL_PRICES = (process.env.DELETE_ALL_PRICES || '').split(',').map(s
 const DELETE_ALL_SIZES = (process.env.DELETE_ALL_SIZES || '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n))
 const CANCEL_BEFORE_END_SECONDS = Math.max(0, parseInt(process.env.CANCEL_BEFORE_END_SECONDS || '0', 10) || 0)
 
-// Pre-parse POST_HOURS into a structure
-const POST_HOURS = {} // POST_HOURS[asset][duration] = Set of allowed 'HH:MM'
+// Pre-parse POST_HOURS into a lookup structure
+// POST_HOURS[asset][duration] = Set of allowed 'HH:MM' (or null if all allowed)
+const POST_HOURS = {}
 for (const asset of ASSETS) {
   POST_HOURS[asset] = {}
   for (const duration of DURATIONS) {
@@ -45,12 +42,13 @@ for (const asset of ASSETS) {
       }).filter(s => s !== 'NaN:NaN')
       POST_HOURS[asset][duration] = new Set(allowedTimes)
     } else {
-      POST_HOURS[asset][duration] = null // null means allow all
+      POST_HOURS[asset][duration] = null
     }
   }
 }
 
-// Generate all market slugs for 5-minute boundaries within the sizing window
+// ─── Slug Generation ─────────────────────────────────────────────────────────
+
 function generateUpcomingSlugs() {
   const nowSec = Math.floor(Date.now() / 1000)
   const windowEndSec = nowSec + Math.ceil(SIZING_WINDOW_MS / 1000)
@@ -74,80 +72,7 @@ function generateUpcomingSlugs() {
   return { slugs, timestamps }
 }
 
-// Look up a single market by slug via the Gamma API
-// Returns { conditionId, tokens, slug } or null
-export async function lookupMarketBySlug(slug) {
-  let retries = 3
-  while (retries > 0) {
-    try {
-      const res = await request(`https://gamma-api.polymarket.com/markets?slug=${slug}`)
-      if (res.statusCode === 200) {
-        const data = await res.body.json()
-        // Gamma returns an array; take first match
-        const market = Array.isArray(data) ? data[0] : data
-        if (!market || !market.conditionId) return null
-        // Extract token IDs from clobTokenIds (array, camelCase from Gamma API)
-        let tokens = []
-        if (Array.isArray(market.clobTokenIds)) {
-          tokens = market.clobTokenIds
-        } else if (typeof market.clobTokenIds === 'string') {
-          try { tokens = JSON.parse(market.clobTokenIds) } catch { }
-        }
-        return {
-          conditionId: market.conditionId,
-          tokens,
-          slug: market.slug || slug,
-        }
-      }
-      await res.body.text() // consume body
-      if (res.statusCode === 429) {
-        await new Promise(r => setTimeout(r, 1500))
-        retries--
-      } else {
-        return null // 404 or other — slug doesn't exist
-      }
-    } catch {
-      retries--
-      if (retries > 0) await new Promise(r => setTimeout(r, 1000))
-    }
-  }
-  return null
-}
-
-let sharedClobClient = null
-
-async function initSharedClobClient() {
-  if (sharedClobClient) return;
-
-  const SIGNATURE_TYPE = FUNDER_ADDRESS && SIGNER_ADDRESS.toLowerCase() !== FUNDER_ADDRESS.toLowerCase() ? 1 : 0;
-
-  let creds = null
-  if (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_API_PASSPHRASE) {
-    creds = {
-      key: process.env.POLY_API_KEY,
-      secret: process.env.POLY_API_SECRET,
-      passphrase: process.env.POLY_API_PASSPHRASE,
-    }
-  }
-
-  let client = new ClobClient("https://clob.polymarket.com", 137, wallet, creds || undefined, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined)
-
-  if (!creds) {
-    console.log("No CLOB API keys found. Deriving credentials via wallet...")
-    creds = await client.createOrDeriveApiKey()
-    client = new ClobClient("https://clob.polymarket.com", 137, wallet, creds, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined)
-  }
-
-  const keysResp = await client.getApiKeys().catch(e => e)
-  if (keysResp && (keysResp.error || keysResp instanceof Error)) {
-    console.error("API Key Error:", keysResp.error || keysResp.message)
-    console.log("Trying to derive new credentials...")
-    creds = await client.createOrDeriveApiKey()
-    client = new ClobClient("https://clob.polymarket.com", 137, wallet, creds, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined)
-  }
-
-  sharedClobClient = client;
-}
+// ─── Pre-Expiry Auto Cancellation ────────────────────────────────────────────
 
 const scheduledExpirySlugs = new Set()
 
@@ -157,52 +82,40 @@ function schedulePreExpiryTimers() {
   for (const asset of ASSETS) {
     for (const duration of DURATIONS) {
       const durationSec = duration === '5m' ? 300 : 900
-      const intervals = durationSec / 300  // 1 for 5m, 3 for 15m
+      const intervals = durationSec / 300
 
-      // Scan boundaries: from earliest currently-running market
-      // to markets starting within the next 20 minutes
       const currentBoundary = Math.floor(nowSec / 300) * 300
       const startFrom = currentBoundary - ((intervals - 1) * 300)
-      const startTo = currentBoundary + 1200  // +20 min of future boundaries
+      const startTo = currentBoundary + 1200 // +20 min of future boundaries
 
       for (let startTs = startFrom; startTs <= startTo; startTs += 300) {
         const endTime = startTs + durationSec
         const cancelAtSec = endTime - CANCEL_BEFORE_END_SECONDS
-        
-        // Skip if cancel time already passed or market already ended
+
         if (cancelAtSec <= nowSec) continue
-        
+
         const slug = `${asset}-updown-${duration}-${startTs}`
         if (scheduledExpirySlugs.has(slug)) continue
 
-        // Schedule precise setTimeout
         const delayMs = (cancelAtSec * 1000) - Date.now()
         scheduledExpirySlugs.add(slug)
 
         setTimeout(async () => {
           try {
             const market = await lookupMarketBySlug(slug)
-            if (!market) return
+            if (!market || !market.marketId) return
 
-            const l2Args = { method: 'GET', requestPath: '/data/orders' }
-            const hdrs = await createL2Headers(wallet, sharedClobClient.creds, l2Args)
-            const ordersRes = await request(
-              `https://clob.polymarket.com/data/orders?market=${market.conditionId}`,
-              { method: 'GET', headers: hdrs, headersTimeout: 10000, bodyTimeout: 10000 }
-            )
-            const ordersJson = ordersRes.statusCode === 200 ? await ordersRes.body.json() : (await ordersRes.body.text(), [])
-            const orders = Array.isArray(ordersJson) ? ordersJson : (ordersJson?.data || [])
-            if (orders.length === 0) return
+            const allOrders = await fetchAllOpenOrders()
+            const marketOrders = allOrders.filter(o => String(o.marketId) === String(market.marketId))
+            if (marketOrders.length === 0) return
 
-            const ids = orders.map(o => o.id)
-            for (let i = 0; i < ids.length; i += 2000) {
-              await sharedClobClient.cancelOrders(ids.slice(i, i + 2000))
-            }
+            const ids = marketOrders.map(o => o.id)
+            await cancelOrders(ids)
             console.log(`\n[pre-expiry] ✓ [${slug}] Canceled ${ids.length} order(s) at T-${CANCEL_BEFORE_END_SECONDS}s`)
           } catch (err) {
             console.error(`\n[pre-expiry] Error for ${slug}: ${err.message}`)
           } finally {
-            scheduledExpirySlugs.delete(slug) // allow re-schedule if needed
+            scheduledExpirySlugs.delete(slug)
           }
         }, delayMs)
       }
@@ -213,75 +126,115 @@ function schedulePreExpiryTimers() {
 function startPreExpiryWatcher() {
   if (CANCEL_BEFORE_END_SECONDS <= 0) return
   console.log(`[pre-expiry] Watcher active: canceling orders exactly ${CANCEL_BEFORE_END_SECONDS}s before market end`)
-  
-  schedulePreExpiryTimers()                          // schedule immediately
-  setInterval(schedulePreExpiryTimers, 60_000)       // refresh every 60s to pick up new markets
+
+  schedulePreExpiryTimers()
+  setInterval(schedulePreExpiryTimers, 60_000)
 }
 
+// ─── Price & Size Computation Helper ─────────────────────────────────────────
+
+function parseOrderPriceAndSize(orderItem) {
+  const order = orderItem.order || {}
+  const side = order.side === 0 ? 'BUY' : 'SELL'
+  const makerWei = BigInt(order.makerAmount || '0')
+  const takerWei = BigInt(order.takerAmount || '0')
+
+  let price = 0
+  let shares = 0
+
+  if (side === 'BUY') {
+    if (takerWei > 0n) {
+      price = Number(makerWei) / Number(takerWei)
+    }
+    shares = Number(takerWei) / 1e18
+  } else {
+    if (makerWei > 0n) {
+      price = Number(takerWei) / Number(makerWei)
+    }
+    shares = Number(makerWei) / 1e18
+  }
+
+  return { price, shares, side, tokenId: order.tokenId }
+}
+
+// ─── Core Cleanup Cycle ──────────────────────────────────────────────────────
+
 async function runCleanup() {
-  console.log(`\n════════════════════════════════════════`)
-  console.log(`Cleanup cycle at ${new Date().toISOString()}`)
+  console.log(`\n════════════════════════════════════════════════════════════════`)
+  console.log(`Predict.fun Cleanup cycle at ${new Date().toISOString()}`)
   if (DELETE_ALL_ORDERS) {
-    console.log(`⚠️  WARNING: DELETE_ALL_ORDERS is set to true. ALL open orders for immediate markets will be canceled!`)
+    console.log(`⚠️  WARNING: DELETE_ALL_ORDERS is true. ALL open orders for discovered markets will be canceled!`)
   }
-  console.log(`════════════════════════════════════════`)
+  console.log(`════════════════════════════════════════════════════════════════`)
 
-  // --- Step 1: Initialize CLOB Client ---
-  try {
-    await initSharedClobClient()
-  } catch (error) {
-    console.error("Failed to initialize CLOB client:", error.message)
-    return
-  }
-  const clobClient = sharedClobClient;
-
-
-  // --- Step 2: Generate Upcoming Slugs ---
+  // Step 1: Generate Upcoming Slugs
   const { slugs, timestamps } = generateUpcomingSlugs()
   const tsLabels = timestamps.map(ts => {
     const d = new Date(ts * 1000)
     return `${d.getUTCHours().toString().padStart(2, '0')}:${d.getUTCMinutes().toString().padStart(2, '0')}`
   }).join(', ')
+
   console.log(`\nAssets: ${ASSETS.join(', ')}`)
   console.log(`Durations: ${DURATIONS.join(', ')}`)
   console.log(`Timestamps: ${tsLabels} UTC (${timestamps.join(', ')})`)
   console.log(`Generated ${slugs.length} slugs to check`)
 
-  // --- Step 3: Look Up Slugs via Gamma API ---
+  // Step 2: Look Up Markets via Predict.fun API
   console.log(`\nLooking up markets...`)
   const foundMarkets = []
 
   for (const slug of slugs) {
     const result = await lookupMarketBySlug(slug)
-    if (result) {
+    if (result && result.marketId) {
       foundMarkets.push(result)
-      console.log(`  ✓ ${slug} → ${result.conditionId.slice(0, 12)}...`)
+      console.log(`  ✓ ${slug} → Market ID: ${result.marketId}`)
     }
   }
 
   if (foundMarkets.length === 0) {
-    console.log(`No matching markets found. Nothing to size.`)
+    console.log(`No active Predict.fun markets found for current window. Nothing to size.`)
     return
   }
 
   console.log(`\nFound ${foundMarkets.length} active market(s)`)
 
-  // --- Step 4: Fetch Orders & Apply Sizing ---
+  // Step 3: Fetch Open Orders on Account
+  console.log(`Fetching live open orders...`)
+  let allOpenOrders = []
+  try {
+    allOpenOrders = await fetchAllOpenOrders()
+  } catch (err) {
+    console.error("Failed to fetch open orders:", err.message)
+    return
+  }
+
+  if (allOpenOrders.length === 0) {
+    console.log("0 open orders across entire account. Nothing to size.")
+    return
+  }
+
+  // Index orders by marketId
+  const ordersByMarketId = new Map()
+  for (const o of allOpenOrders) {
+    const mId = String(o.marketId)
+    if (!ordersByMarketId.has(mId)) ordersByMarketId.set(mId, [])
+    ordersByMarketId.get(mId).push(o)
+  }
+
+  // Step 4: Apply Sizing & Deduplication Rules
   const sizingToCancel = []
 
-  // Helper: check if a slug should have ALL orders deleted
   const shouldDeleteAll = (slug) => {
     if (DELETE_ALL_ORDERS) return true
     if (DELETE_ALL_SLUGS.some(pattern => slug.includes(pattern))) return true
     if (isTwapThresholdBreached(slug)) return true
-    
-    // Check POST_HOURS
+
+    // Check POST_HOURS restriction
     const parts = slug.split('-')
     if (parts.length >= 4) {
       const asset = parts[0]
       const duration = parts[2]
-      const tsStr = parts.pop() // The timestamp is the last part
-      const ts = parseInt(tsStr, 10)
+      const ts = parseInt(parts[parts.length - 1], 10)
       if (!isNaN(ts) && POST_HOURS[asset] && POST_HOURS[asset][duration] !== undefined) {
         const allowedSet = POST_HOURS[asset][duration]
         if (allowedSet !== null) {
@@ -290,139 +243,119 @@ async function runCleanup() {
           const mm = d.getUTCMinutes().toString().padStart(2, '0')
           const timeStr = `${hh}:${mm}`
           if (!allowedSet.has(timeStr)) {
-            return true // Not in allowed times, so delete all orders
+            return true
           }
         }
       }
     }
-    
     return false
   }
 
   if (DELETE_ALL_ORDERS) {
-    console.log(`\n--- Precautionary: Canceling all open orders for immediate markets ---`)
+    console.log(`\n--- Sizing: Canceling all open orders for immediate markets ---`)
   } else if (DELETE_ALL_SLUGS.length > 0) {
     console.log(`\n--- Sizing: Delete-all for slugs matching [${DELETE_ALL_SLUGS.join(', ')}]; keep oldest pair per price for the rest ---`)
   } else {
-    console.log(`\n--- Sizing: Keep oldest order pair per (outcome, price) for all markets ---`)
+    console.log(`\n--- Sizing: Keep single oldest order per (outcome, price) for all markets ---`)
   }
   if (DELETE_ALL_PRICES.length > 0) {
-    console.log(`    Also deleting ALL orders at price(s): ${DELETE_ALL_PRICES.join(', ')}`);
+    console.log(`    Also deleting ALL orders at price(s): ${DELETE_ALL_PRICES.join(', ')}`)
+  }
+  if (DELETE_ALL_SIZES.length > 0) {
+    console.log(`    Also deleting ALL orders at size(s): ${DELETE_ALL_SIZES.join(', ')}`)
   }
 
   for (const market of foundMarkets) {
-    let orders = []
-    try {
-      const l2HeaderArgs = { method: 'GET', requestPath: '/data/orders' }
-      const headers = await createL2Headers(wallet, sharedClobClient.creds, l2HeaderArgs)
-      const res = await request(
-        `https://clob.polymarket.com/data/orders?market=${market.conditionId}`,
-        { method: 'GET', headers, headersTimeout: 10000, bodyTimeout: 10000 }
-      )
-      if (res.statusCode === 200) {
-        const json = await res.body.json()
-        orders = Array.isArray(json) ? json : (json?.data || [])
-      } else {
-        const errBody = await res.body.text()
-        console.error(`  [${market.slug}] HTTP ${res.statusCode} fetching orders: ${errBody}`)
-        continue
-      }
-    } catch (e) {
-      console.error(`  Error fetching orders for ${market.slug}: ${e.message}`)
+    const marketOrders = ordersByMarketId.get(String(market.marketId)) || []
+
+    if (marketOrders.length === 0) {
+      console.log(`  [${market.slug}] 0 open orders`)
       continue
     }
 
-    if (orders.length === 0) {
-      console.log(`  ${market.slug}: no open orders`)
-      continue
-    }
-
-    // Per-market decision: delete all vs keep oldest
+    // Delete all if conditions met
     if (shouldDeleteAll(market.slug)) {
-      const toCancel = orders.map(o => o.id)
+      const toCancel = marketOrders.map(o => o.id)
       sizingToCancel.push(...toCancel)
-      console.log(`  [${market.slug}] ${orders.length} orders found. All scheduled for cancellation.`)
+      console.log(`  [${market.slug}] ${marketOrders.length} orders scheduled for cancellation (delete-all condition).`)
       continue
     }
 
-    // Group orders by asset_id (Up vs Down)
-    const assetGroups = {}
-    for (const order of orders) {
-      if (!assetGroups[order.asset_id]) assetGroups[order.asset_id] = []
-      assetGroups[order.asset_id].push(order)
+    // Group orders by tokenId (Up vs Down outcome)
+    const outcomeGroups = {}
+    for (const orderItem of marketOrders) {
+      const parsed = parseOrderPriceAndSize(orderItem)
+      const tokenKey = parsed.tokenId || 'default'
+      if (!outcomeGroups[tokenKey]) outcomeGroups[tokenKey] = []
+      outcomeGroups[tokenKey].push({ orderItem, ...parsed })
     }
 
-    // Reverse each group so oldest first (API returns newest first)
-    for (const groupOrders of Object.values(assetGroups)) {
-      groupOrders.reverse()
-    }
+    console.log(`\n  [${market.slug}] ${marketOrders.length} orders across ${Object.keys(outcomeGroups).length} outcome(s)`)
 
-    console.log(`\n  [${market.slug}] ${orders.length} orders across ${Object.keys(assetGroups).length} outcomes`)
-
-    for (const [assetId, assetOrders] of Object.entries(assetGroups)) {
-      // Sub-group by price within each outcome
+    for (const [tokenId, tokenOrders] of Object.entries(outcomeGroups)) {
+      // Sub-group by price
       const priceGroups = {}
-      for (const order of assetOrders) {
-        const priceKey = parseFloat(order.price).toString()
+      for (const item of tokenOrders) {
+        const priceKey = item.price.toFixed(4)
         if (!priceGroups[priceKey]) priceGroups[priceKey] = []
-        priceGroups[priceKey].push(order)
+        priceGroups[priceKey].push(item)
       }
 
-      const priceKeys = Object.keys(priceGroups)
-      for (const priceKey of priceKeys) {
-        const priceOrders = priceGroups[priceKey]
-        const price = parseFloat(priceKey)
+      for (const [priceKey, groupItems] of Object.entries(priceGroups)) {
+        const priceVal = parseFloat(priceKey)
 
-        // If this price is in DELETE_ALL_PRICES, cancel everything at this price
-        if (DELETE_ALL_PRICES.length > 0 && DELETE_ALL_PRICES.includes(price)) {
-          const toCancel = priceOrders.map(o => o.id)
+        // 1. DELETE_ALL_PRICES filter
+        if (DELETE_ALL_PRICES.length > 0 && DELETE_ALL_PRICES.some(p => Math.abs(p - priceVal) < 0.0001)) {
+          const toCancel = groupItems.map(i => i.orderItem.id)
           sizingToCancel.push(...toCancel)
-          console.log(`    └─ ${assetId.slice(0, 12)}... @ price=${price}: deleting ALL ${toCancel.length} orders (DELETE_ALL_PRICES)`)
+          console.log(`    └─ Token ${tokenId.slice(0, 10)}... @ price=${priceKey}: deleting ALL ${toCancel.length} orders (DELETE_ALL_PRICES)`)
           continue
         }
 
-        // Delete orders with specific sizes before picking the oldest
-        let validOrders = []
-        for (const order of priceOrders) {
-          const size = parseFloat(order.original_size || order.size)
-          if (DELETE_ALL_SIZES.length > 0 && DELETE_ALL_SIZES.includes(size)) {
-            sizingToCancel.push(order.id)
-            console.log(`    └─ ${assetId.slice(0, 12)}... @ price=${price}: deleting order id=${order.id.slice(0, 8)}... (size=${size}) (DELETE_ALL_SIZES)`)
+        // 2. DELETE_ALL_SIZES filter
+        let validItems = []
+        for (const item of groupItems) {
+          if (DELETE_ALL_SIZES.length > 0 && DELETE_ALL_SIZES.some(s => Math.abs(s - item.shares) < 0.01)) {
+            sizingToCancel.push(item.orderItem.id)
+            console.log(`    └─ Token ${tokenId.slice(0, 10)}... @ price=${priceKey}: deleting order id=${item.orderItem.id} (size=${item.shares.toFixed(2)}) (DELETE_ALL_SIZES)`)
           } else {
-            validOrders.push(order)
+            validItems.push(item)
           }
         }
 
-        if (validOrders.length <= 1) {
-          if (validOrders.length === 1) {
-            const size = parseFloat(validOrders[0].original_size || validOrders[0].size)
-            console.log(`    └─ ${assetId.slice(0, 12)}... @ price=${price}: only 1 order (size=${size}), keeping as-is`)
+        if (validItems.length <= 1) {
+          if (validItems.length === 1) {
+            console.log(`    └─ Token ${tokenId.slice(0, 10)}... @ price=${priceKey}: only 1 order (size=${validItems[0].shares.toFixed(2)}), keeping as-is`)
           } else {
-            console.log(`    └─ ${assetId.slice(0, 12)}... @ price=${price}: no valid orders remaining after size filtering`)
+            console.log(`    └─ Token ${tokenId.slice(0, 10)}... @ price=${priceKey}: no valid orders remaining`)
           }
           continue
         }
 
-        // Keep the first (oldest) valid order at this price, cancel all newer ones
-        const kept = validOrders[0]
-        const toCancel = validOrders.slice(1).map(o => o.id)
+        // Sort ascending by BigInt(id): oldest order has lowest sequential ID
+        validItems.sort((a, b) => {
+          const idA = BigInt(a.orderItem.id || '0')
+          const idB = BigInt(b.orderItem.id || '0')
+          return idA < idB ? -1 : idA > idB ? 1 : 0
+        })
+
+        // Keep the oldest, cancel all newer duplicates
+        const kept = validItems[0]
+        const duplicates = validItems.slice(1)
+        const toCancel = duplicates.map(d => d.orderItem.id)
         sizingToCancel.push(...toCancel)
 
-        const keptSize = parseFloat(kept.original_size || kept.size)
-        console.log(`    └─ ${assetId.slice(0, 12)}... @ price=${price}: keeping oldest (size=${keptSize}), canceling ${toCancel.length}`)
+        console.log(`    └─ Token ${tokenId.slice(0, 10)}... @ price=${priceKey}: keeping oldest (ID=${kept.orderItem.id}, size=${kept.shares.toFixed(2)}), canceling ${toCancel.length} duplicate(s)`)
       }
     }
   }
 
-  // --- Step 5: Execute Cancellations ---
-  if (sizingToCancel.length > 0 && clobClient) {
-    console.log(`\nCanceling ${sizingToCancel.length} excess orders...`)
+  // Step 5: Execute Cancellations
+  if (sizingToCancel.length > 0) {
+    console.log(`\nCanceling ${sizingToCancel.length} excess order(s) on Predict.fun...`)
     try {
-      for (let i = 0; i < sizingToCancel.length; i += 2000) {
-        const batch = sizingToCancel.slice(i, i + 2000)
-        await clobClient.cancelOrders(batch)
-      }
-      console.log("Cancellation complete.")
+      const res = await cancelOrders(sizingToCancel)
+      console.log(`✓ Cancellation complete: ${res.removedCount} order(s) removed from orderbook.`)
     } catch (cancelErr) {
       console.error("Cancellation error:", cancelErr.message)
     }
@@ -433,26 +366,32 @@ async function runCleanup() {
   console.log(`Cleanup finished at ${new Date().toISOString()}`)
 }
 
+// ─── Entrypoint & Continuous Loop ────────────────────────────────────────────
+
 async function start() {
-  console.log("PM Sizer — Proactive Slug-Based Sizing")
-  console.log(`Signer: ${SIGNER_ADDRESS}`)
-  console.log(`Assets: ${ASSETS.join(', ')}`)
-  console.log(`Durations: ${DURATIONS.join(', ')}`)
-  console.log(`Delete All Orders Toggle: ${DELETE_ALL_ORDERS}`)
-  console.log(`Delete All Slugs: ${DELETE_ALL_SLUGS.length > 0 ? DELETE_ALL_SLUGS.join(', ') : '(none)'}`)
-  console.log(`Delete All Prices: ${DELETE_ALL_PRICES.length > 0 ? DELETE_ALL_PRICES.join(', ') : '(none)'}`)
-  console.log(`Delete All Sizes: ${DELETE_ALL_SIZES.length > 0 ? DELETE_ALL_SIZES.join(', ') : '(none)'}`)
-  console.log(`Cancel Before End: ${CANCEL_BEFORE_END_SECONDS > 0 ? CANCEL_BEFORE_END_SECONDS + 's' : 'disabled'}`)
+  console.log("PF Sizer — Predict.fun Proactive Sizing & Order Management")
+  console.log(`Signer:        ${SIGNER_ADDRESS}`)
+  console.log(`Account/Maker: ${MAKER_ADDRESS}`)
+  console.log(`Smart Account: ${IS_KERNEL ? 'ZeroDev Kernel (Privy Export)' : 'EOA'}`)
+  console.log(`Assets:        ${ASSETS.join(', ')}`)
+  console.log(`Durations:     ${DURATIONS.join(', ')}`)
+  console.log(`Delete All:    ${DELETE_ALL_ORDERS}`)
+  console.log(`Delete Slugs:  ${DELETE_ALL_SLUGS.length > 0 ? DELETE_ALL_SLUGS.join(', ') : '(none)'}`)
+  console.log(`Delete Prices: ${DELETE_ALL_PRICES.length > 0 ? DELETE_ALL_PRICES.join(', ') : '(none)'}`)
+  console.log(`Delete Sizes:  ${DELETE_ALL_SIZES.length > 0 ? DELETE_ALL_SIZES.join(', ') : '(none)'}`)
+  console.log(`Pre-Expiry:    ${CANCEL_BEFORE_END_SECONDS > 0 ? CANCEL_BEFORE_END_SECONDS + 's' : 'disabled'}`)
+
   const configuredThres = ASSETS.map(a => {
     const t = getThreshold(a)
     return t !== null ? `${a.toUpperCase()}: ±${t}%` : null
   }).filter(Boolean)
-  console.log(`TWAP Thresholds: ${configuredThres.length > 0 ? configuredThres.join(', ') : 'disabled'}`)
+  console.log(`TWAP Limits:   ${configuredThres.length > 0 ? configuredThres.join(', ') : 'disabled'}`)
 
   try {
-    await initSharedClobClient()
+    await authenticate()
+    console.log("✓ Authenticated with Predict.fun successfully.\n")
   } catch (err) {
-    console.error("Failed to initialize CLOB client on startup:", err.message)
+    console.error("Failed to authenticate on startup:", err.message)
     process.exit(1)
   }
 
@@ -461,9 +400,6 @@ async function start() {
   const hasTwapThresholds = ASSETS.some(a => getThreshold(a) !== null)
   if (hasTwapThresholds) {
     startTwapWatcher({
-      clobClient: sharedClobClient,
-      wallet,
-      creds: sharedClobClient.creds,
       lookupMarketBySlug,
       assets: ASSETS,
       durations: DURATIONS,
@@ -471,21 +407,22 @@ async function start() {
   }
 
   if (process.env.CANCEL_OPPOSITE_ON_FILL === 'true') {
-    startWatcher().catch(err => console.error("Watcher error:", err))
+    startWatcher().catch(err => console.error("Fill Watcher error:", err))
   }
 
   while (true) {
-    const startTime = Date.now();
+    const startTime = Date.now()
     try {
       await runCleanup()
     } catch (err) {
       console.error("Unhandled error in runCleanup:", err)
     }
-    const executionTime = Date.now() - startTime;
-    const waitMs = Math.max(0, 300000 - executionTime); // 5 minutes minus execution time
-    console.log(`\nNext run in ${Math.floor(waitMs / 1000 / 60)}m ${Math.floor((waitMs / 1000) % 60)}s...\n`)
+    const executionTime = Date.now() - startTime
+    const waitMs = Math.max(0, 300000 - executionTime) // 5 minutes minus execution time
+    console.log(`\nNext cycle in ${Math.floor(waitMs / 1000 / 60)}m ${Math.floor((waitMs / 1000) % 60)}s...\n`)
     await new Promise(resolve => setTimeout(resolve, waitMs))
   }
 }
 
+export { lookupMarketBySlug }
 start()
