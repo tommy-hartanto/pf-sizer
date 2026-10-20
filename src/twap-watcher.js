@@ -190,7 +190,15 @@ async function checkThresholdsForActiveMarkets({
     if (nowSec >= endTime) continue
 
     const slug = `${asset}-updown-${duration}-${activeTs}`
-    if (triggeredSlugs.has(slug)) continue
+
+    if (triggeredSlugs.has(slug)) {
+      if (nowSec >= endTime - 10) {
+        ensureLivestreamForAsset(asset)
+      }
+      continue
+    }
+
+    ensureLivestreamForAsset(asset)
 
     let openPrice = marketOpenPrices.get(slug)
     if (!openPrice) {
@@ -213,23 +221,44 @@ async function checkThresholdsForActiveMarkets({
     if (deltaPercent >= threshold) {
       triggeredSlugs.add(slug)
 
+      let market = null
       try {
-        const market = await lookupMarketBySlug(slug)
-        if (!market || !market.marketId) continue
+        market = await lookupMarketBySlug(slug)
+        if (market && market.marketId) {
+          const allOrders = await fetchAllOpenOrders()
+          const marketOrders = (allOrders || []).filter(o => o && String(o.marketId) === String(market.marketId))
 
-        const allOrders = await fetchAllOpenOrders()
-        const marketOrders = allOrders.filter(o => String(o.marketId) === String(market.marketId))
-
-        if (marketOrders.length === 0) {
-          console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | 0 orders found`)
-          continue
+          if (marketOrders.length === 0) {
+            console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | 0 orders found`)
+          } else if (marketOrders.length === 1) {
+            console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | Only 1 order found, skipping cancelation`)
+          } else {
+            const ids = marketOrders.map(o => o.id)
+            await cancelOrders(ids)
+            console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | Canceled ${ids.length} order(s)`)
+          }
         }
-
-        const ids = marketOrders.map(o => o.id)
-        await cancelOrders(ids)
-        console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | Canceled ${ids.length} order(s)`)
       } catch (cancelErr) {
         console.error(`[${timeStr()}] [BREACH] Error for ${slug}: ${cancelErr.message}`)
+      }
+
+      // Check if any other active target market for this asset remains unbreached in this round
+      const otherActive = targets.some(t => {
+        if (t.asset.toLowerCase() !== asset.toLowerCase()) return false
+        const durSec = t.duration === '15m' ? 900 : 300
+        const aTs = Math.floor(nowSec / durSec) * durSec
+        const s = `${t.asset}-updown-${t.duration}-${aTs}`
+        return s !== slug && !triggeredSlugs.has(s) && nowSec < aTs + durSec
+      })
+
+      if (!otherActive) {
+        dropLivestreamForAsset(asset)
+      }
+
+      if (onBreach && market && market.marketId) {
+        try {
+          onBreach({ slug, asset, marketId: market.marketId })
+        } catch {}
       }
     }
   }
@@ -251,74 +280,139 @@ let binanceWs = null
 let reconnectTimeout = null
 let checkInterval = null
 let isShuttingDown = false
+const activeStreams = new Set()
+
+export function dropLivestreamForAsset(asset) {
+  const sym = asset.toLowerCase()
+  const stream = `${sym}usdt@ticker`
+  if (!activeStreams.has(stream)) return
+
+  activeStreams.delete(stream)
+
+  if (binanceWs && binanceWs.readyState === WebSocket.OPEN) {
+    try {
+      binanceWs.send(JSON.stringify({
+        method: 'UNSUBSCRIBE',
+        params: [stream],
+        id: Date.now()
+      }))
+      console.log(`[${timeStr()}] [WS] Dropped livestream for ${asset.toUpperCase()} (${stream}) after threshold breach`)
+    } catch (err) {
+      console.error(`[${timeStr()}] [WS] Error unsubscribing from ${stream}: ${err.message}`)
+    }
+  }
+
+  if (activeStreams.size === 0 && binanceWs) {
+    console.log(`[${timeStr()}] [WS] All market livestreams dropped. Closing WebSocket connection to avoid redundant workload`)
+    try {
+      binanceWs.removeAllListeners('close')
+      binanceWs.close()
+    } catch {}
+    binanceWs = null
+  }
+}
+
+export function ensureLivestreamForAsset(asset) {
+  const sym = asset.toLowerCase()
+  const stream = `${sym}usdt@ticker`
+  if (activeStreams.has(stream)) return
+
+  activeStreams.add(stream)
+
+  if (!binanceWs || binanceWs.readyState !== WebSocket.OPEN) {
+    connectBinanceWs()
+  } else {
+    try {
+      binanceWs.send(JSON.stringify({
+        method: 'SUBSCRIBE',
+        params: [stream],
+        id: Date.now()
+      }))
+      console.log(`[${timeStr()}] [WS] Resumed livestream for ${asset.toUpperCase()} (${stream}) for active market round`)
+    } catch (err) {
+      console.error(`[${timeStr()}] [WS] Error subscribing to ${stream}: ${err.message}`)
+    }
+  }
+}
+
+function connectBinanceWs() {
+  if (isShuttingDown || activeStreams.size === 0) return
+
+  if (binanceWs) {
+    binanceWs.removeAllListeners()
+    binanceWs.terminate()
+    binanceWs = null
+  }
+
+  const streamList = [...activeStreams].join('/')
+  const streamUrl = `wss://${BINANCE_WS_HOST}:9443/stream?streams=${streamList}`
+
+  binanceWs = new WebSocket(streamUrl, {
+    lookup: customDohLookup,
+    headers: { 'User-Agent': 'pf-sizer/2.0' },
+  })
+
+  binanceWs.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString())
+      const payload = msg.data || msg
+      const rawSymbol = payload.s || ''
+      if (!rawSymbol.endsWith('USDT')) return
+
+      const sym = rawSymbol.slice(0, -4).toLowerCase()
+      if (!activeStreams.has(`${sym}usdt@ticker`)) return
+
+      const priceStr = payload.c
+      if (!priceStr) return
+
+      const price = parseFloat(priceStr)
+      if (isNaN(price)) return
+
+      const tsMs = payload.E || Date.now()
+      recordPriceTick(sym, price, tsMs)
+    } catch {}
+  })
+
+  binanceWs.on('close', () => {
+    if (!isShuttingDown && activeStreams.size > 0) {
+      reconnectTimeout = setTimeout(connectBinanceWs, 3000)
+    }
+  })
+}
 
 export function startTwapWatcher({
   lookupMarketBySlug,
   targets = parseConfiguredTargets(),
+  onBreach = null,
 }) {
   const uniqueAssets = [...new Set(targets.map(t => t.asset))]
   const configuredAssets = uniqueAssets.filter(a => getThreshold(a) !== null)
   if (configuredAssets.length === 0) return { stop: () => {} }
 
-  const streams = uniqueAssets.map(a => `${a.toLowerCase()}usdt@ticker`).join('/')
-  const streamUrl = `wss://${BINANCE_WS_HOST}:9443/stream?streams=${streams}`
-
-  function connect() {
-    if (isShuttingDown) return
-
-    if (binanceWs) {
-      binanceWs.removeAllListeners()
-      binanceWs.terminate()
-      binanceWs = null
-    }
-
-    binanceWs = new WebSocket(streamUrl, {
-      lookup: customDohLookup,
-      headers: { 'User-Agent': 'pf-sizer/2.0' },
-    })
-
-    binanceWs.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString())
-        const payload = msg.data || msg
-        const rawSymbol = payload.s || ''
-        if (!rawSymbol.endsWith('USDT')) return
-
-        const sym = rawSymbol.slice(0, -4).toLowerCase()
-        const priceStr = payload.c
-        if (!priceStr) return
-
-        const price = parseFloat(priceStr)
-        if (isNaN(price)) return
-
-        const tsMs = payload.E || Date.now()
-        recordPriceTick(sym, price, tsMs)
-      } catch {}
-    })
-
-    binanceWs.on('close', () => {
-      if (!isShuttingDown) {
-        reconnectTimeout = setTimeout(connect, 3000)
-      }
-    })
+  for (const a of configuredAssets) {
+    activeStreams.add(`${a.toLowerCase()}usdt@ticker`)
   }
 
-  connect()
+  connectBinanceWs()
 
   checkInterval = setInterval(() => {
     checkThresholdsForActiveMarkets({
       lookupMarketBySlug,
       targets,
+      onBreach,
     }).catch(err => console.error(`[${timeStr()}] [TWAP] Error: ${err.message}`))
   }, 1000)
 
   return {
     stop: () => {
       isShuttingDown = true
+      activeStreams.clear()
       if (reconnectTimeout) clearTimeout(reconnectTimeout)
       if (checkInterval) clearInterval(checkInterval)
       if (binanceWs) binanceWs.close()
     },
+    dropLivestreamForAsset,
+    ensureLivestreamForAsset,
   }
 }
 

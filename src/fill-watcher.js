@@ -59,6 +59,22 @@ async function syncOpenOrders() {
   } catch {}
 }
 
+export function dropMarketFromFillWatcher(marketId) {
+  if (!marketId) return
+  const idStr = String(marketId)
+  let count = 0
+  for (const [id, ord] of knownOrders.entries()) {
+    if (String(ord.marketId) === idStr) {
+      knownOrders.delete(id)
+      count++
+    }
+  }
+  marketCache.delete(idStr)
+  if (count > 0) {
+    console.log(`[${timeStr()}] [FILL] Dropped ${count} order(s) for breached market ${idStr} from active fill tracking`)
+  }
+}
+
 export async function cancelOppositeOrders(marketId, filledTokenId) {
   if (!marketId || !filledTokenId) return
 

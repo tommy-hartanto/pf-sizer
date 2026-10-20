@@ -19,7 +19,7 @@ Auto-cancels duplicate orders, cleans up expired/cancelled markets, cancels orde
   - `POST_HOURS_<ASSET>_<DURATION>`: Restrict trading to specific UTC hours/minutes.
 - **Pre-Expiry Auto-Cancel**: `CANCEL_BEFORE_END_SECONDS` automatically cancels orders $T-X$ seconds before market round close.
 - **Opposite-Order Cancellation on Fill**: `CANCEL_OPPOSITE_ON_FILL` subscribes to real-time wallet events (`predictWalletEvents/{jwt}` with 15s heartbeat echo) and automatically wipes out opposite-outcome resting orders when an order fills.
-- **TWAP / Price Deviation Watcher**: Real-time reference spot price feed synchronized with Binance Spot WebSocket (`data-stream.binance.vision`) with Cloudflare DoH. Cancels orders when market price moves beyond `CANCEL_THRES_<ASSET>` (e.g. $\pm 0.3\%$).
+- **TWAP / Price Deviation Watcher**: Real-time reference spot price feed synchronized with Binance Spot WebSocket (`data-stream.binance.vision`) with Cloudflare DoH. Cancels orders when market price moves beyond `CANCEL_THRES_<ASSET>` (e.g. $\pm 0.3\%$) if more than 1 open order exists (safely preserving single resting orders), and automatically drops the WebSocket livestream for the breached market to eliminate redundant workload until the next round.
 - **CLI Order Inspector**: `npm run fetch` quickly displays all open resting orders across markets with price, shares, USDT value, and outcome names.
 
 ---

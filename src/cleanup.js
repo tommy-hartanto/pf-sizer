@@ -8,7 +8,7 @@ import {
   cancelOrders,
   authenticate
 } from './predict-client.js'
-import { startWatcher } from './fill-watcher.js'
+import { startWatcher, dropMarketFromFillWatcher } from './fill-watcher.js'
 import { startTwapWatcher, isTwapThresholdBreached, getThreshold } from './twap-watcher.js'
 
 function timeStr() {
@@ -210,7 +210,6 @@ async function runCleanup(waitMs = 300000) {
   const shouldDeleteAll = (slug) => {
     if (DELETE_ALL_ORDERS) return true
     if (DELETE_ALL_SLUGS.some(pattern => slug.includes(pattern))) return true
-    if (isTwapThresholdBreached(slug)) return true
 
     const parts = slug.split('-')
     if (parts.length >= 4) {
@@ -243,6 +242,13 @@ async function runCleanup(waitMs = 300000) {
 
     if (shouldDeleteAll(market.slug)) {
       sizingToCancel.push(...marketOrders.map(o => o.id))
+      continue
+    }
+
+    if (isTwapThresholdBreached(market.slug)) {
+      if (marketOrders.length > 1) {
+        sizingToCancel.push(...marketOrders.map(o => o.id))
+      }
       continue
     }
 
@@ -334,6 +340,9 @@ async function start() {
     startTwapWatcher({
       lookupMarketBySlug,
       targets: TARGETS,
+      onBreach: ({ marketId }) => {
+        dropMarketFromFillWatcher(marketId)
+      },
     })
   }
 
@@ -356,5 +365,9 @@ async function start() {
   }
 }
 
+import { fileURLToPath } from 'url'
 export { lookupMarketBySlug }
-start()
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  start()
+}
