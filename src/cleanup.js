@@ -102,6 +102,24 @@ export function generateActiveSlugs(includeUpcoming = true) {
   return { slugs, timestamps: [...new Set(timestamps)], targets }
 }
 
+export function generateImmediateFutureSlugs() {
+  const nowSec = Math.floor(Date.now() / 1000)
+  const targets = parseConfiguredTargets()
+
+  const slugs = []
+  const timestamps = []
+
+  for (const { asset, duration } of targets) {
+    const durationSec = duration === '15m' ? 900 : 300
+    const activeTs = Math.floor(nowSec / durationSec) * durationSec
+    const nextTs = activeTs + durationSec
+    slugs.push(`${asset}-updown-${duration}-${nextTs}`)
+    timestamps.push(nextTs)
+  }
+
+  return { slugs, timestamps: [...new Set(timestamps)], targets }
+}
+
 // ─── Pre-Expiry Auto Cancellation ────────────────────────────────────────────
 
 const scheduledExpirySlugs = new Set()
@@ -181,7 +199,7 @@ function parseOrderPriceAndSize(orderItem) {
 // ─── Core Cleanup Cycle ──────────────────────────────────────────────────────
 
 async function runCleanup(waitMs = 300000) {
-  const { slugs } = generateActiveSlugs(true)
+  const { slugs } = generateImmediateFutureSlugs()
   const foundMarkets = []
 
   for (const slug of slugs) {
@@ -192,7 +210,7 @@ async function runCleanup(waitMs = 300000) {
   }
 
   if (foundMarkets.length === 0) {
-    console.log(`[${timeStr()}] ${slugs.join(', ')}: Market not yet discovered`)
+    console.log(`[${timeStr()}] [FUTURE-SIZING] ${slugs.join(', ')}: Market not yet discovered`)
     return
   }
 
@@ -314,12 +332,12 @@ async function runCleanup(waitMs = 300000) {
   if (sizingToCancel.length > 0) {
     try {
       const res = await cancelOrders(sizingToCancel)
-      console.log(`[${timeStr()}] [SIZING] ${slugLabel}: Canceled ${res.removedCount} duplicate/excess order(s). Kept ${activeOrdersCount - sizingToCancel.length} (next cycle in ${nextStr})`)
+      console.log(`[${timeStr()}] [FUTURE-SIZING] ${slugLabel}: Canceled ${res.removedCount} duplicate/excess order(s). Kept ${activeOrdersCount - sizingToCancel.length} (next cycle in ${nextStr})`)
     } catch (cancelErr) {
-      console.error(`[${timeStr()}] [SIZING] Error canceling orders: ${cancelErr.message}`)
+      console.error(`[${timeStr()}] [FUTURE-SIZING] Error canceling orders: ${cancelErr.message}`)
     }
   } else {
-    console.log(`[${timeStr()}] ${slugLabel}: ${activeOrdersCount} open order(s) OK (next cycle in ${nextStr})`)
+    console.log(`[${timeStr()}] [FUTURE-SIZING] ${slugLabel}: ${activeOrdersCount} open order(s) OK (next cycle in ${nextStr})`)
   }
 }
 
