@@ -198,8 +198,8 @@ function parseOrderPriceAndSize(orderItem) {
 
 // ─── Core Cleanup Cycle ──────────────────────────────────────────────────────
 
-async function runCleanup(waitMs = 300000) {
-  const { slugs } = generateImmediateFutureSlugs()
+async function runCleanup(waitMs = 15000, isCheckpoint = true) {
+  const { slugs } = generateActiveSlugs(true)
   const foundMarkets = []
 
   for (const slug of slugs) {
@@ -210,7 +210,9 @@ async function runCleanup(waitMs = 300000) {
   }
 
   if (foundMarkets.length === 0) {
-    console.log(`[${timeStr()}] [FUTURE-SIZING] ${slugs.join(', ')}: Market not yet discovered`)
+    if (isCheckpoint) {
+      console.log(`[${timeStr()}] [SIZING] ${slugs.join(', ')}: Market not yet discovered`)
+    }
     return
   }
 
@@ -332,12 +334,12 @@ async function runCleanup(waitMs = 300000) {
   if (sizingToCancel.length > 0) {
     try {
       const res = await cancelOrders(sizingToCancel)
-      console.log(`[${timeStr()}] [FUTURE-SIZING] ${slugLabel}: Canceled ${res.removedCount} duplicate/excess order(s). Kept ${activeOrdersCount - sizingToCancel.length} (next cycle in ${nextStr})`)
+      console.log(`[${timeStr()}] [SIZING] ${slugLabel}: Canceled ${res.removedCount} duplicate/excess order(s). Kept ${activeOrdersCount - sizingToCancel.length} (next cycle in ${nextStr})`)
     } catch (cancelErr) {
-      console.error(`[${timeStr()}] [FUTURE-SIZING] Error canceling orders: ${cancelErr.message}`)
+      console.error(`[${timeStr()}] [SIZING] Error canceling orders: ${cancelErr.message}`)
     }
-  } else {
-    console.log(`[${timeStr()}] [FUTURE-SIZING] ${slugLabel}: ${activeOrdersCount} open order(s) OK (next cycle in ${nextStr})`)
+  } else if (isCheckpoint) {
+    console.log(`[${timeStr()}] [SIZING] ${slugLabel}: ${activeOrdersCount} open order(s) OK (next cycle in ${nextStr})`)
   }
 }
 
@@ -375,29 +377,28 @@ async function start() {
   }
 
   while (true) {
-    const now = Date.now()
-    const candleDurationMs = 300000 // 5m base cadence
-    const nextBoundaryMs = (Math.floor(now / candleDurationMs) + 1) * candleDurationMs
+    const nowSec = Math.floor(Date.now() / 1000)
+    const secIntoCandle = nowSec % 300 // 0 to 299
 
-    // Two check targets per candle:
-    // 1. Pre-open advance sizing: 20s before the boundary (boundary - 20s)
-    // 2. Active candle boundary: 1s after the boundary (boundary + 1s)
-    const advanceTargetMs = nextBoundaryMs - 20000
-    const boundaryTargetMs = nextBoundaryMs + 1000
+    let waitMs
+    let isCheckpoint = false
 
-    let nextTargetMs
-    if (now < advanceTargetMs - 2000) {
-      nextTargetMs = advanceTargetMs
-    } else if (now < boundaryTargetMs - 2000) {
-      nextTargetMs = boundaryTargetMs
+    if (secIntoCandle < 25) {
+      // Hot burst window immediately after candle open (where pf-poster instances fire)
+      waitMs = 3000
+      isCheckpoint = (secIntoCandle <= 3)
+    } else if (secIntoCandle >= 275) {
+      // Pre-open advance window before next candle
+      waitMs = 5000
+      isCheckpoint = (secIntoCandle >= 290)
     } else {
-      nextTargetMs = (nextBoundaryMs + candleDurationMs) - 20000
+      // Steady resting window mid-candle
+      waitMs = 15000
+      isCheckpoint = false
     }
 
-    const waitMs = Math.max(3000, nextTargetMs - now)
-
     try {
-      await runCleanup(waitMs)
+      await runCleanup(waitMs, isCheckpoint)
     } catch (err) {
       console.error(`[${timeStr()}] Error in runCleanup: ${err.message}`)
     }
