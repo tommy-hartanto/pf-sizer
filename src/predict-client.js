@@ -264,7 +264,7 @@ export async function fetchAllOpenOrders() {
   while (hasMore && attempts > 0) {
     try {
       const jwt = await getJwtToken()
-      let url = `${BASE_URL}/orders?first=50&status=OPEN`
+      let url = `${BASE_URL}/orders?first=150&status=OPEN`
       if (cursor) url += `&after=${encodeURIComponent(cursor)}`
 
       const headers = {
@@ -343,12 +343,23 @@ export async function cancelOrders(orderIds) {
 
         if (res.statusCode === 200) {
           const json = await res.body.json()
-          const removed = json?.removed || batch
+          const removed = Array.isArray(json?.removed) ? json.removed : []
+          const noop = Array.isArray(json?.noop) ? json.noop : []
+          const rejected = Array.isArray(json?.rejected) ? json.rejected : []
           removedCount += removed.length
+
+          if (noop.length > 0 || rejected.length > 0) {
+            console.warn(`[Predict.fun] Cancel batch result: ${removed.length} removed, ${noop.length} noop (already filled/closed), ${rejected.length} rejected`)
+          }
           break
         }
 
         if (res.statusCode === 401) {
+          const errText = await res.body.text()
+          if (errText.includes('belong to this wallet') || errText.includes('invalid')) {
+            console.warn(`[Predict.fun] Order cancel rejected (ownership): ${errText}`)
+            break
+          }
           cachedJwt = null
           await authenticate()
           retries--

@@ -176,6 +176,7 @@ function findHistoricalPrice(asset, targetTsSec) {
 async function checkThresholdsForActiveMarkets({
   lookupMarketBySlug,
   targets,
+  onBreach,
 }) {
   const nowSec = Math.floor(Date.now() / 1000)
 
@@ -234,8 +235,8 @@ async function checkThresholdsForActiveMarkets({
             console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | Only 1 order found, skipping cancelation`)
           } else {
             const ids = marketOrders.map(o => o.id)
-            await cancelOrders(ids)
-            console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | Canceled ${ids.length} order(s)`)
+            const res = await cancelOrders(ids)
+            console.log(`[${timeStr()}] [BREACH] ${slug}: Delta ${deltaPercent.toFixed(2)}% >= ${threshold}% (Open: $${openPrice.toFixed(2)} -> Now: $${currentTwap.toFixed(2)}) | Canceled ${res?.removedCount ?? ids.length} order(s)`)
           }
         }
       } catch (cancelErr) {

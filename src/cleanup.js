@@ -79,7 +79,7 @@ for (const { asset, duration } of TARGETS) {
 
 // ─── Active Market Slug Generation ───────────────────────────────────────────
 
-export function generateActiveSlugs() {
+export function generateActiveSlugs(includeUpcoming = true) {
   const nowSec = Math.floor(Date.now() / 1000)
   const targets = parseConfiguredTargets()
 
@@ -91,6 +91,12 @@ export function generateActiveSlugs() {
     const activeTs = Math.floor(nowSec / durationSec) * durationSec
     slugs.push(`${asset}-updown-${duration}-${activeTs}`)
     timestamps.push(activeTs)
+
+    if (includeUpcoming) {
+      const nextTs = activeTs + durationSec
+      slugs.push(`${asset}-updown-${duration}-${nextTs}`)
+      timestamps.push(nextTs)
+    }
   }
 
   return { slugs, timestamps: [...new Set(timestamps)], targets }
@@ -175,7 +181,7 @@ function parseOrderPriceAndSize(orderItem) {
 // ─── Core Cleanup Cycle ──────────────────────────────────────────────────────
 
 async function runCleanup(waitMs = 300000) {
-  const { slugs } = generateActiveSlugs()
+  const { slugs } = generateActiveSlugs(true)
   const foundMarkets = []
 
   for (const slug of slugs) {
@@ -352,8 +358,25 @@ async function start() {
 
   while (true) {
     const now = Date.now()
-    const nextBoundaryMs = (Math.floor(now / 300000) + 1) * 300000 + 1000
-    const waitMs = Math.max(5000, nextBoundaryMs - now)
+    const candleDurationMs = 300000 // 5m base cadence
+    const nextBoundaryMs = (Math.floor(now / candleDurationMs) + 1) * candleDurationMs
+
+    // Two check targets per candle:
+    // 1. Pre-open advance sizing: 20s before the boundary (boundary - 20s)
+    // 2. Active candle boundary: 1s after the boundary (boundary + 1s)
+    const advanceTargetMs = nextBoundaryMs - 20000
+    const boundaryTargetMs = nextBoundaryMs + 1000
+
+    let nextTargetMs
+    if (now < advanceTargetMs - 2000) {
+      nextTargetMs = advanceTargetMs
+    } else if (now < boundaryTargetMs - 2000) {
+      nextTargetMs = boundaryTargetMs
+    } else {
+      nextTargetMs = (nextBoundaryMs + candleDurationMs) - 20000
+    }
+
+    const waitMs = Math.max(3000, nextTargetMs - now)
 
     try {
       await runCleanup(waitMs)
